@@ -1,621 +1,828 @@
 /**
  * ==========================================================
- * VIP GOD TIER AI - SERVER V18 (CỰC DÀI - 10 TẦNG PHÂN TÍCH)
+ * VIP GOD TIER AI - SERVER V20 (FULL - HỌC CẦU ĐÀNG HOÀNG)
  * ==========================================================
- * Hệ thống phân tích Tài Xỉu & MD5 tự động.
- * Tích hợp 10 tầng thuật toán: Bệt, 1-1, 2-2, 3-3, Pattern Matrix,
- * Telemetry, Bù trừ, Fibonacci, Markov Chain, Phân tích Nhịp độ.
- * 
- * Tác giả: VIP GOD TIER AI
- * Ngày cập nhật: 2024
+ * Cài đặt:
+ *   npm init -y
+ *   npm i express axios cors
+ *   node server.js
+ *
+ * Endpoints:
+ *   GET  /taixiu               → dự đoán TX
+ *   GET  /md5                  → dự đoán MD5
+ *   GET  /lstaixiu             → lịch sử TX
+ *   GET  /lsmd5                → lịch sử MD5
+ *   GET  /status               → trạng thái server
+ *   GET  /backtest?type=tx     → backtest tổng
+ *   GET  /backtest/:layer      → backtest từng tầng
+ *   GET  /export?type=tx       → xuất lịch sử JSON
+ *   POST /reset                → reset lịch sử
+ *
+ * Lưu ý khoa học:
+ *   Tài Xỉu là sự kiện độc lập. Không có thuật toán nào
+ *   dự đoán được. Code này được viết để CHỨNG MINH điều đó
+ *   bằng backtest — chứ không phải để thắng bạc.
  * ==========================================================
  */
 
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
+// ==========================================================
+// 1. CẤU HÌNH
+// ==========================================================
+const CONFIG = {
+  PORT: process.env.PORT || 3000,
+  API: {
+    tx: 'https://wtx.tele68.com/v1/tx/sessions',
+    md5: 'https://wtxmd52.tele68.com/v1/txmd5/sessions'
+  },
+  MIN_PHIEN: 20,
+  MAX_STORE: 200,
+  TIMEOUT: 15000,
+  UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+  FILE: {
+    tx: path.join(__dirname, 'history_tx.json'),
+    md5: path.join(__dirname, 'history_md5.json')
+  },
+  BANKROLL: {
+    initial: 1000,
+    baseBet: 10,
+    maxBet: 50,
+    stopLoss: 300,
+    takeProfit: 500,
+    kellyFraction: 0.25
+  },
+  WEIGHTS: {
+    streak: 1.0, zigzag: 1.0, pattern: 1.2, matrix: 0.8,
+    dice: 0.6, balance: 1.0, fibonacci: 0.5, markov: 1.0,
+    rhythm: 0.9, entropy: 0.7, learner: 2.0  // learner weight cao nhất
+  },
+  LEARNER: {
+    minSamples: 3,
+    patternLength: 5,
+    decayFactor: 0.95,
+    maxPatterns: 5000
+  },
+  SIGNAL: {
+    minToPredict: 0.03,
+    maxConfidence: 85,
+    minConfidence: 50
+  }
+};
+
+// ==========================================================
+// 2. LOG
+// ==========================================================
+const COLORS = {
+  reset: '\x1b[0m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  gray: '\x1b[90m'
+};
+
+function log(level, msg) {
+  const ts = new Date().toISOString();
+  const color = {
+    INFO: COLORS.cyan, WARN: COLORS.yellow, ERROR: COLORS.red,
+    DEBUG: COLORS.gray, WIN: COLORS.green, LOSE: COLORS.red,
+    LEARN: COLORS.magenta
+  }[level] || COLORS.reset;
+  console.log(`${COLORS.gray}[${ts}]${COLORS.reset} ${color}[${level}]${COLORS.reset} ${msg}`);
+}
+
+// ==========================================================
+// 3. MEMORY + PERSISTENCE
+// ==========================================================
+const defaultMem = () => ({
+  lastPhien: null, lastPred: null, history: [],
+  totalWin: 0, totalLose: 0,
+  bankroll: CONFIG.BANKROLL.initial,
+  stopped: false,
+  peakBankroll: CONFIG.BANKROLL.initial,
+  maxDrawdown: 0,
+  learnerPatterns: {}   // pattern -> {T, X, lastSeen}
+});
+
+const memory = {
+  tx: loadMem('tx'),
+  md5: loadMem('md5')
+};
+
+function loadMem(type) {
+  try {
+    if (fs.existsSync(CONFIG.FILE[type])) {
+      const raw = JSON.parse(fs.readFileSync(CONFIG.FILE[type], 'utf8'));
+      return { ...defaultMem(), ...raw };
+    }
+  } catch (e) {
+    log('ERROR', `Không load được ${type} history: ${e.message}`);
+  }
+  return defaultMem();
+}
+
+function saveMem(type) {
+  try {
+    fs.writeFileSync(CONFIG.FILE[type], JSON.stringify(memory[type], null, 2));
+  } catch (e) {
+    log('ERROR', `Không save được ${type}: ${e.message}`);
+  }
+}
+
+// ==========================================================
+// 4. TIỆN ÍCH
+// ==========================================================
+function toSeq(list) {
+  // list[0] mới nhất → đảo lại cũ -> mới
+  return list.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X').reverse();
+}
+
+function diceSeq(list) {
+  return list.map(x => ({ point: x.point, dices: x.dices })).reverse();
+}
+
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+// ==========================================================
+// 5. TẦNG 1: STREAK
+// ==========================================================
+function analyzeStreak(h) {
+  if (!h || h.length < 2) return { signal: 0, reason: '' };
+  const L = h.length, last = h[L - 1];
+  let n = 1;
+  for (let i = L - 2; i >= 0; i--) { if (h[i] === last) n++; else break; }
+  if (n >= 2 && n <= 3) { const s = 0.3 * (n - 1); return { signal: last === 'T' ? s : -s, reason: `Bám bệt ${n} tay` }; }
+  if (n === 4) return { signal: last === 'T' ? -0.2 : 0.2, reason: 'Bệt 4 — nghi ngờ' };
+  return { signal: 0, reason: `Bệt dài ${n} — không bẻ` };
+}
+
+// ==========================================================
+// 6. TẦNG 2: ZIGZAG
+// ==========================================================
+function analyzeZigzag(h) {
+  if (!h || h.length < 4) return { signal: 0, reason: '' };
+  const L = h.length, last = h[L - 1];
+  let zz = 0;
+  for (let i = L - 1; i >= 1; i--) { if (h[i] !== h[i - 1]) zz++; else break; }
+  if (zz >= 3) { const s = Math.min(0.4, zz * 0.1); return { signal: last === 'T' ? -s : s, reason: `Cầu đảo ${zz} nhịp` }; }
+  return { signal: 0, reason: '' };
+}
+
+// ==========================================================
+// 7. TẦNG 3: PATTERN
+// ==========================================================
+function analyzePattern(h) {
+  if (!h || h.length < 6) return { signal: 0, reason: '' };
+  const last = h[h.length - 1];
+  const l4 = h.slice(-4).join(''), l6 = h.slice(-6).join('');
+  if (l6 === 'TTTXXX') return { signal: last === 'X' ? 0.5 : -0.5, reason: 'Pattern 3-3' };
+  if (l6 === 'XXXTTT') return { signal: last === 'T' ? -0.5 : 0.5, reason: 'Pattern 3-3' };
+  if (l4 === 'TTXX') return { signal: last === 'X' ? 0.3 : -0.3, reason: 'Pattern 2-2' };
+  if (l4 === 'XXTT') return { signal: last === 'T' ? -0.3 : 0.3, reason: 'Pattern 2-2' };
+  return { signal: 0, reason: '' };
+}
+
+// ==========================================================
+// 8. TẦNG 4: MATRIX
+// ==========================================================
+function analyzeMatrix(h) {
+  if (!h || h.length < 15) return { signal: 0, reason: '' };
+  const L = h.length, pat = h.slice(-5).join('');
+  let mT = 0, mX = 0;
+  for (let i = 0; i < L - 5; i++) {
+    if (h.slice(i, i + 5).join('') === pat) {
+      if (h[i + 5] === 'T') mT++; else if (h[i + 5] === 'X') mX++;
+    }
+  }
+  const total = mT + mX;
+  if (total < 2) return { signal: 0, reason: '' };
+  const ratio = mT / total;
+  const conf = Math.min(1, total / 5);
+  return { signal: (ratio - 0.5) * 2 * conf, reason: `Matrix ${mT}T/${mX}X` };
+}
+
+// ==========================================================
+// 9. TẦNG 5: DICE
+// ==========================================================
+function analyzeDice(dh) {
+  if (!dh || dh.length < 5) return { signal: 0, reason: '' };
+  const r = dh.slice(0, 5).map(d => d.point || 0);
+  const avg = r.reduce((a, b) => a + b, 0) / r.length;
+  const dev = avg - 10.5;
+  if (Math.abs(dev) < 1) return { signal: 0, reason: '' };
+  return { signal: clamp(-dev / 6, -0.3, 0.3), reason: `Xúc xắc TB ${avg.toFixed(1)}` };
+}
+
+// ==========================================================
+// 10. TẦNG 6: BALANCE (z-score)
+// ==========================================================
+function analyzeBalance(h) {
+  if (!h || h.length < 15) return { signal: 0, reason: '' };
+  const w = h.slice(-20), n = w.length;
+  const cT = w.filter(x => x === 'T').length;
+  const p = cT / n;
+  const z = (p - 0.5) / Math.sqrt(0.25 / n);
+  if (Math.abs(z) < 1.5) return { signal: 0, reason: '' };
+  return { signal: clamp(-z * 0.15, -0.5, 0.5), reason: `z=${z.toFixed(2)} (${cT}T/${n - cT}X)` };
+}
+
+// ==========================================================
+// 11. TẦNG 7: FIBONACCI
+// ==========================================================
+function analyzeFib(h) {
+  if (!h || h.length < 10) return { signal: 0, reason: '' };
+  const L = h.length, pos = [1, 2, 3, 5, 8];
+  let fT = 0, fX = 0;
+  for (const p of pos) { if (L - p >= 0) { if (h[L - p] === 'T') fT++; else fX++; } }
+  const total = fT + fX;
+  if (total === 0) return { signal: 0, reason: '' };
+  return { signal: ((fT - fX) / total) * 0.3, reason: `Fib ${fT}T/${fX}X` };
+}
+
+// ==========================================================
+// 12. TẦNG 8: MARKOV
+// ==========================================================
+function analyzeMarkov(h) {
+  if (!h || h.length < 20) return { signal: 0, reason: '' };
+  const L = h.length, last = h[L - 1];
+  let tt = 0, tx = 0, xt = 0, xx = 0;
+  for (let i = 0; i < L - 1; i++) {
+    if (h[i] === 'T' && h[i + 1] === 'T') tt++;
+    if (h[i] === 'T' && h[i + 1] === 'X') tx++;
+    if (h[i] === 'X' && h[i + 1] === 'T') xt++;
+    if (h[i] === 'X' && h[i + 1] === 'X') xx++;
+  }
+  if (last === 'T') {
+    const t = tt + tx;
+    if (t >= 5) return { signal: ((tt - tx) / t) * 0.4, reason: `Markov T→(T${tt}/X${tx})` };
+  } else {
+    const t = xt + xx;
+    if (t >= 5) return { signal: ((xx - xt) / t) * 0.4, reason: `Markov X→(X${xx}/T${xt})` };
+  }
+  return { signal: 0, reason: '' };
+}
+
+// ==========================================================
+// 13. TẦNG 9: RHYTHM
+// ==========================================================
+function analyzeRhythm(h) {
+  if (!h || h.length < 8) return { signal: 0, reason: '' };
+  const r8 = h.slice(-8), cT = r8.filter(x => x === 'T').length;
+  const p = r8.join('');
+  if (p === 'TTXXTTXX') return { signal: -0.4, reason: 'Nhịp 2-2-2-2' };
+  if (p === 'XXTTXXTT') return { signal: 0.4, reason: 'Nhịp 2-2-2-2' };
+  if (cT >= 6) return { signal: -0.3, reason: `Nghiêng Tài (${cT}/8)` };
+  if (cT <= 2) return { signal: 0.3, reason: `Nghiêng Xỉu (${cT}/8)` };
+  return { signal: 0, reason: '' };
+}
+
+// ==========================================================
+// 14. TẦNG 10: ENTROPY
+// ==========================================================
+function analyzeEntropy(h) {
+  if (!h || h.length < 10) return { signal: 0, reason: '', entropy: 0 };
+  const L = h.length, cT = h.filter(x => x === 'T').length;
+  const pT = cT / L, pX = 1 - pT;
+  let e = 0;
+  if (pT > 0) e -= pT * Math.log2(pT);
+  if (pX > 0) e -= pX * Math.log2(pX);
+  if (e > 0.98) return { signal: 0, reason: `Entropy cao (${e.toFixed(3)})`, entropy: e };
+  return { signal: 0, reason: '', entropy: e };
+}
+
+// ==========================================================
+// 15. TẦNG 11: LEARNER — HỌC CẦU ĐÀNG HOÀNG
+// ==========================================================
+/**
+ * Học từ lịch sử: pattern N ký tự → xác suất ký tự tiếp theo
+ * Đây là cách "học cầu" thực sự: đếm chứ không đoán mò.
+ * Nhưng vì xúc xắc độc lập → pattern học được cũng ~50/50.
+ * Điểm khác biệt: learner có TRỌNG SỐ CAO NHẤT, nên nếu nó
+ * thực sự tìm được pattern có edge, engine sẽ tin nó.
+ */
+function analyzeLearner(history, patterns) {
+  if (!history || history.length < CONFIG.MIN_PHIEN) return { signal: 0, reason: '' };
+
+  // 1. Học: duyệt toàn bộ lịch sử, đếm pattern → next
+  const learned = {};
+  const N = CONFIG.LEARNER.patternLength;
+  const decay = CONFIG.LEARNER.decayFactor;
+
+  for (let i = 0; i < history.length - N; i++) {
+    const pat = history.slice(i, i + N).join('');
+    const next = history[i + N];
+    if (!learned[pat]) learned[pat] = { T: 0, X: 0, total: 0 };
+    // Trọng số giảm dần theo thời gian (mẫu cũ ít quan trọng hơn)
+    const age = history.length - i;
+    const weight = Math.pow(decay, age / 10);
+    if (next === 'T') learned[pat].T += weight;
+    else learned[pat].X += weight;
+    learned[pat].total += weight;
+  }
+
+  // 2. Predict dựa trên pattern hiện tại
+  const currentPat = history.slice(-N).join('');
+  const stat = learned[currentPat];
+
+  if (!stat || stat.total < CONFIG.LEARNER.minSamples) {
+    return { signal: 0, reason: 'Learner: chưa đủ mẫu' };
+  }
+
+  const pT = stat.T / stat.total;
+  const pX = stat.X / stat.total;
+  const edge = pT - pX; // [-1, 1]
+  const confidence = Math.min(1, stat.total / 10); // càng nhiều mẫu càng tin
+
+  const signal = clamp(edge * confidence, -0.8, 0.8);
+
+  // Cập nhật patterns (dùng cho lần sau — không bắt buộc)
+  if (Object.keys(patterns).length < CONFIG.LEARNER.maxPatterns) {
+    patterns[currentPat] = {
+      T: Math.round(stat.T * 100) / 100,
+      X: Math.round(stat.X * 100) / 100,
+      total: Math.round(stat.total * 100) / 100,
+      pT: pT,
+      lastSeen: Date.now()
+    };
+  }
+
+  return {
+    signal,
+    reason: `Learner: pat[${currentPat}] → T${stat.T.toFixed(1)}/X${stat.X.toFixed(1)} (p=${pT.toFixed(2)})`
+  };
+}
+
+// ==========================================================
+// 16. ENGINE TỔNG HỢP
+// ==========================================================
+function runEngine(history, diceHist, patterns) {
+  if (!history || history.length < CONFIG.MIN_PHIEN) {
+    return { predict: 'CHỜ', confidence: '0%', reason: 'Chưa đủ dữ liệu', detail: [], rawSignal: 0 };
+  }
+
+  const parts = [
+    { name: 'Streak',    ...analyzeStreak(history),              w: CONFIG.WEIGHTS.streak },
+    { name: 'Zigzag',    ...analyzeZigzag(history),              w: CONFIG.WEIGHTS.zigzag },
+    { name: 'Pattern',   ...analyzePattern(history),             w: CONFIG.WEIGHTS.pattern },
+    { name: 'Matrix',    ...analyzeMatrix(history),              w: CONFIG.WEIGHTS.matrix },
+    { name: 'Dice',      ...analyzeDice(diceHist),               w: CONFIG.WEIGHTS.dice },
+    { name: 'Balance',   ...analyzeBalance(history),             w: CONFIG.WEIGHTS.balance },
+    { name: 'Fibonacci', ...analyzeFib(history),                 w: CONFIG.WEIGHTS.fibonacci },
+    { name: 'Markov',    ...analyzeMarkov(history),              w: CONFIG.WEIGHTS.markov },
+    { name: 'Rhythm',    ...analyzeRhythm(history),              w: CONFIG.WEIGHTS.rhythm },
+    { name: 'Entropy',   ...analyzeEntropy(history),             w: CONFIG.WEIGHTS.entropy },
+    { name: 'Learner',   ...analyzeLearner(history, patterns),   w: CONFIG.WEIGHTS.learner }
+  ];
+
+  let sum = 0, wsum = 0, agreeT = 0, agreeX = 0, neutral = 0;
+
+  for (const p of parts) {
+    const s = p.signal || 0;
+    sum += s * p.w;
+    wsum += p.w;
+    if (s > 0.05) agreeT++;
+    else if (s < -0.05) agreeX++;
+    else neutral++;
+  }
+
+  const finalSignal = wsum > 0 ? sum / wsum : 0;
+
+  if (Math.abs(finalSignal) < CONFIG.SIGNAL.minToPredict) {
+    return {
+      predict: 'CHỜ', confidence: '50%',
+      reason: 'Tín hiệu yếu — bỏ qua',
+      detail: parts.map(p => ({ name: p.name, signal: (p.signal || 0).toFixed(3), reason: p.reason || '—' })),
+      rawSignal: finalSignal
+    };
+  }
+
+  const predict = finalSignal > 0 ? 'TÀI' : 'XỈU';
+  const agree = predict === 'TÀI' ? agreeT : agreeX;
+  const totalVotes = agreeT + agreeX + neutral;
+  const agreeRatio = totalVotes > 0 ? agree / totalVotes : 0;
+  const strength = Math.abs(finalSignal);
+
+  let confPct = 50 + agreeRatio * 30 + strength * 20;
+  confPct = clamp(confPct, CONFIG.SIGNAL.minConfidence, CONFIG.SIGNAL.maxConfidence);
+
+  return {
+    predict,
+    confidence: `${confPct.toFixed(0)}%`,
+    reason: parts.filter(p => p.reason).slice(0, 5).map(p => p.reason).join(' + '),
+    detail: parts.map(p => ({ name: p.name, signal: (p.signal || 0).toFixed(3), reason: p.reason || '—' })),
+    rawSignal: finalSignal,
+    votes: { T: agreeT, X: agreeX, neutral }
+  };
+}
+
+// ==========================================================
+// 17. FETCH
+// ==========================================================
+async function fetchData(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await axios.get(url, {
+        headers: { 'User-Agent': CONFIG.UA, 'Accept': 'application/json' },
+        timeout: CONFIG.TIMEOUT
+      });
+      if (res.status === 200 && res.data) return res.data;
+    } catch (e) {
+      log('ERROR', `Fetch lần ${i + 1}: ${e.message}`);
+      if (i === retries - 1) return null;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  return null;
+}
+
+// ==========================================================
+// 18. QUẢN LÝ VỐN — KELLY CRITERION
+// ==========================================================
+function calcBetSize(mem, confidencePct) {
+  const p = confidencePct / 100;
+  // Kelly: f = (p*b - q) / b, với b=1 (cược 1 ăn 1)
+  // f = 2p - 1
+  const kelly = Math.max(0, 2 * p - 1);
+  const f = kelly * CONFIG.BANKROLL.kellyFraction;
+  const bet = clamp(
+    CONFIG.BANKROLL.baseBet * (1 + f * 10),
+    CONFIG.BANKROLL.baseBet,
+    CONFIG.BANKROLL.maxBet
+  );
+  return Math.round(bet);
+}
+
+function updateBankroll(mem, isWin, confidencePct) {
+  if (mem.stopped) return;
+
+  const bet = calcBetSize(mem, confidencePct);
+  if (isWin) mem.bankroll += bet;
+  else mem.bankroll -= bet;
+
+  if (mem.bankroll > mem.peakBankroll) mem.peakBankroll = mem.bankroll;
+  const dd = mem.peakBankroll - mem.bankroll;
+  if (dd > mem.maxDrawdown) mem.maxDrawdown = dd;
+
+  const profit = mem.bankroll - CONFIG.BANKROLL.initial;
+  if (profit <= -CONFIG.BANKROLL.stopLoss) {
+    mem.stopped = true;
+    log('WARN', `🛑 STOP-LOSS: lỗ ${Math.abs(profit).toFixed(0)}`);
+  }
+  if (profit >= CONFIG.BANKROLL.takeProfit) {
+    mem.stopped = true;
+    log('WIN', `🎯 TAKE-PROFIT: lãi ${profit.toFixed(0)}`);
+  }
+}
+
+// ==========================================================
+// 19. XỬ LÝ CHÍNH
+// ==========================================================
+async function processGame(type) {
+  const url = CONFIG.API[type];
+  const data = await fetchData(url);
+  if (!data || !data.list || data.list.length === 0) {
+    throw new Error('Không lấy được dữ liệu API');
+  }
+
+  const list = data.list;
+  const currentPhien = String(list[0].id);
+  const history = toSeq(list);
+  const dh = diceSeq(list);
+  const mem = memory[type];
+
+  // Chấm điểm phiên trước
+  if (mem.lastPhien && mem.lastPred) {
+    const cur = parseFloat(currentPhien), prev = parseFloat(mem.lastPhien);
+    if (cur > prev) {
+      const actualObj = list.find(x => String(x.id) === mem.lastPhien);
+      if (actualObj) {
+        const actual = actualObj.resultTruyenThong === 'TAI' ? 'TÀI' : 'XỈU';
+        const isWin = actual === mem.lastPred;
+        const conf = mem.lastConfidence || 50;
+
+        mem.history.push({
+          phien: mem.lastPhien,
+          duDoan: mem.lastPred,
+          ketQua: actual,
+          status: isWin ? 'WIN' : 'LOSE',
+          tiLe: mem.lastConfidence,
+          timestamp: Date.now()
+        });
+
+        if (isWin) mem.totalWin++; else mem.totalLose++;
+        if (mem.history.length > CONFIG.MAX_STORE) mem.history.shift();
+
+        updateBankroll(mem, isWin, conf);
+        saveMem(type);
+
+        log(isWin ? 'WIN' : 'LOSE', `[${type}] Phiên ${mem.lastPhien}: ${mem.lastPred} vs ${actual} → ${isWin ? '✅' : '❌'}`);
+      } else {
+        log('WARN', `[${type}] Không tìm thấy phiên ${mem.lastPhien}`);
+      }
+    }
+  }
+
+  // Dự đoán
+  const pred = runEngine(history, dh, mem.learnerPatterns);
+  mem.lastPhien = currentPhien;
+  mem.lastPred = pred.predict !== 'CHỜ' ? pred.predict : null;
+  mem.lastConfidence = pred.predict !== 'CHỜ' ? parseInt(pred.confidence) : null;
+
+  log('INFO', `[${type}] Dự đoán ${parseFloat(currentPhien) + 1}: ${pred.predict} (${pred.confidence})`);
+
+  return {
+    phienHienTai: currentPhien,
+    phienDuDoan: String(parseFloat(currentPhien) + 1),
+    duDoan: pred.predict,
+    tiLe: pred.confidence,
+    liDo: pred.reason,
+    chiTiet: pred.detail,
+    votes: pred.votes,
+    rawSignal: pred.rawSignal,
+    xucXac: list[0].dices || [],
+    tongDiem: list[0].point || 0,
+    thongKe: {
+      win: mem.totalWin,
+      lose: mem.totalLose,
+      winrate: mem.totalWin + mem.totalLose > 0
+        ? ((mem.totalWin / (mem.totalWin + mem.totalLose)) * 100).toFixed(1) + '%' : '—',
+      bankroll: mem.bankroll.toFixed(0),
+      maxDrawdown: mem.maxDrawdown.toFixed(0),
+      stopped: mem.stopped
+    }
+  };
+}
+
+// ==========================================================
+// 20. BACKTEST
+// ==========================================================
+async function runBacktest(type, limit = 500) {
+  log('INFO', `Backtest ${type} — limit ${limit}`);
+  const url = CONFIG.API[type];
+  let all = [], page = 1;
+
+  while (all.length < limit && page <= 15) {
+    try {
+      const res = await axios.get(url, {
+        headers: { 'User-Agent': CONFIG.UA },
+        params: { page, limit: 100 },
+        timeout: CONFIG.TIMEOUT
+      });
+      const list = res.data?.list || [];
+      if (list.length === 0) break;
+      all = all.concat(list);
+      log('DEBUG', `Trang ${page}: +${list.length} (tổng ${all.length})`);
+      if (list.length < 100) break;
+      page++;
+    } catch (e) {
+      log('ERROR', `Trang ${page}: ${e.message}`);
+      break;
+    }
+  }
+
+  if (all.length === 0) throw new Error('Không lấy được dữ liệu');
+
+  all.sort((a, b) => parseFloat(a.id) - parseFloat(b.id));
+  const seq = all.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X');
+  const diceArr = all.map(x => ({ point: x.point, dices: x.dices }));
+
+  let win = 0, lose = 0, skip = 0;
+  const detail = [];
+  const patterns = {};
+
+  for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
+    const hist = seq.slice(0, i);
+    const dh = diceArr.slice(0, i).reverse();
+    const pred = runEngine(hist, dh, patterns);
+
+    if (pred.predict === 'CHỜ') { skip++; continue; }
+    const actual = seq[i] === 'T' ? 'TÀI' : 'XỈU';
+    const isWin = pred.predict === actual;
+    if (isWin) win++; else lose++;
+
+    if (detail.length < 30) {
+      detail.push({
+        phien: all[i].id, duDoan: pred.predict, ketQua: actual,
+        status: isWin ? 'WIN' : 'LOSE', tiLe: pred.confidence
+      });
+    }
+  }
+
+  const total = win + lose;
+  const winrate = total > 0 ? (win / total * 100).toFixed(2) : '0';
+
+  // Random baseline
+  let rW = 0, rL = 0;
+  for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
+    const g = Math.random() < 0.5 ? 'TÀI' : 'XỈU';
+    const a = seq[i] === 'T' ? 'TÀI' : 'XỈU';
+    if (g === a) rW++; else rL++;
+  }
+  const randomWr = (rW / (rW + rL) * 100).toFixed(2);
+
+  return {
+    tongPhien: seq.length,
+    soLanDuDoan: total, soLanBoQua: skip,
+    win, lose,
+    winrate: `${winrate}%`,
+    randomWinrate: `${randomWr}%`,
+    ketLuan: parseFloat(winrate) > 52
+      ? '⚠️ Đáng ngờ — kiểm tra lookahead bias'
+      : parseFloat(winrate) >= 48
+        ? '✅ ~50% — đúng kỳ vọng toán học (random)'
+        : '❌ Dưới 50% — tệ hơn random',
+    chiTiet30: detail
+  };
+}
+
+async function backtestLayer(type, layerName, limit = 500) {
+  log('INFO', `Backtest layer ${layerName} — ${type} — limit ${limit}`);
+  const url = CONFIG.API[type];
+  let all = [];
+  let page = 1;
+
+  while (all.length < limit && page <= 15) {
+    try {
+      const res = await axios.get(url, {
+        headers: { 'User-Agent': CONFIG.UA },
+        params: { page, limit: 100 },
+        timeout: CONFIG.TIMEOUT
+      });
+      const list = res.data?.list || [];
+      if (list.length === 0) break;
+      all = all.concat(list);
+      if (list.length < 100) break;
+      page++;
+    } catch (e) { break; }
+  }
+
+  if (all.length === 0) throw new Error('Không có dữ liệu');
+  all.sort((a, b) => parseFloat(a.id) - parseFloat(b.id));
+  const seq = all.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X');
+  const diceArr = all.map(x => ({ point: x.point, dices: x.dices }));
+
+  // Map layer → function
+  const layerFns = {
+    streak: (h) => analyzeStreak(h),
+    zigzag: (h) => analyzeZigzag(h),
+    pattern: (h) => analyzePattern(h),
+    matrix: (h) => analyzeMatrix(h),
+    dice: (h, d) => analyzeDice(d),
+    balance: (h) => analyzeBalance(h),
+    fibonacci: (h) => analyzeFib(h),
+    markov: (h) => analyzeMarkov(h),
+    rhythm: (h) => analyzeRhythm(h),
+    entropy: (h) => analyzeEntropy(h),
+    learner: (h, d, p) => analyzeLearner(h, p)
+  };
+
+  const fn = layerFns[layerName];
+  if (!fn) throw new Error(`Layer không hợp lệ: ${layerName}`);
+
+  let win = 0, lose = 0, skip = 0;
+  const patterns = {};
+
+  for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
+    const hist = seq.slice(0, i);
+    const dh = diceArr.slice(0, i).reverse();
+    const res = fn(hist, dh, patterns);
+    if (!res || Math.abs(res.signal || 0) < 0.03) { skip++; continue; }
+    const pred = res.signal > 0 ? 'TÀI' : 'XỈU';
+    const actual = seq[i] === 'T' ? 'TÀI' : 'XỈU';
+    if (pred === actual) win++; else lose++;
+  }
+
+  const total = win + lose;
+  return {
+    layer: layerName, type,
+    tongPhien: seq.length, soLanDuDoan: total, soLanBoQua: skip,
+    win, lose,
+    winrate: total > 0 ? `${(win / total * 100).toFixed(2)}%` : '0%'
+  };
+}
+
+// ==========================================================
+// 21. EXPRESS ROUTES
+// ==========================================================
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ==========================================================
-// CẤU HÌNH API GỐC VÀ HẰNG SỐ HỆ THỐNG
-// ==========================================================
-const API_TX_URL = 'https://wtx.tele68.com/v1/tx/sessions';
-const API_MD5_URL = 'https://wtxmd52.tele68.com/v1/txmd5/sessions';
-
-const CONFIG = {
-    MIN_PHIEN_REQUIRED: 20,
-    MAX_HISTORY_STORE: 100, // Lưu tối đa 100 phiên vào bộ nhớ
-    FETCH_TIMEOUT: 15000,
-    USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    LOG_LEVEL: 'INFO' // 'DEBUG' | 'INFO' | 'ERROR'
-};
-
-// ==========================================================
-// BỘ NHỚ TẠM (LƯU LỊCH SỬ VÀ TRẠNG THÁI)
-// ==========================================================
-let memory = {
-    tx: { 
-        lastPhien: null, 
-        lastPred: null, 
-        history: [], 
-        streakLog: [], 
-        totalWin: 0, 
-        totalLose: 0 
-    },
-    md5: { 
-        lastPhien: null, 
-        lastPred: null, 
-        history: [], 
-        streakLog: [], 
-        totalWin: 0, 
-        totalLose: 0 
-    }
-};
-
-// ==========================================================
-// HÀM TIỆN ÍCH LOG
-// ==========================================================
-function log(level, message) {
-    const timestamp = new Date().toISOString();
-    if (level === 'ERROR') console.error(`[${timestamp}] [ERROR] ${message}`);
-    else if (level === 'DEBUG' && CONFIG.LOG_LEVEL === 'DEBUG') console.log(`[${timestamp}] [DEBUG] ${message}`);
-    else if (level === 'INFO') console.log(`[${timestamp}] [INFO] ${message}`);
-}
-
-// ==========================================================
-// HÀM FETCH DỮ LIỆU TỪ API (CÓ RETRY)
-// ==========================================================
-async function fetchGameData(url, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            log('DEBUG', `Đang fetch dữ liệu từ ${url} (Lần thử ${i + 1}/${retries})`);
-            const res = await axios.get(url, {
-                headers: {
-                    'User-Agent': CONFIG.USER_AGENT,
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
-                },
-                timeout: CONFIG.FETCH_TIMEOUT
-            });
-            
-            if (res.status === 200 && res.data) {
-                log('DEBUG', `Fetch thành công từ ${url.split('/')[2]}`);
-                return res.data;
-            }
-        } catch (error) {
-            log('ERROR', `Lỗi fetch ${url.split('/')[2]} (Lần ${i + 1}): ${error.message}`);
-            if (i === retries - 1) return null;
-            await new Promise(resolve => setTimeout(resolve, 1000)); // Đợi 1s trước khi retry
-        }
-    }
-    return null;
-}
-
-// ==========================================================
-// TẦNG 1: PHÂN TÍCH CẦU BỆT (STREAK ANALYZER)
-// ==========================================================
-function analyzeStreak(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '', streakLen: 0 };
-    if (!history || history.length < 2) return result;
-
-    const len = history.length;
-    const last = history[len - 1];
-    let streakLen = 1;
-
-    for (let i = len - 2; i >= 0; i--) {
-        if (history[i] === last) streakLen++;
-        else break;
-    }
-
-    result.streakLen = streakLen;
-
-    if (streakLen >= 2 && streakLen <= 4) {
-        // Bệt ngắn 2-4 tay: Đánh tiếp
-        const score = streakLen * 15;
-        if (last === 'T') result.scoreT += score;
-        else result.scoreX += score;
-        result.reason = `Bám bệt ${streakLen} tay`;
-    } else if (streakLen >= 5) {
-        // Bệt dài >= 5 tay: Cực kỳ nguy hiểm, ưu tiên bẻ
-        const score = streakLen * 20;
-        if (last === 'T') result.scoreX += score;
-        else result.scoreT += score;
-        result.reason = `Ép bẻ bệt dài ${streakLen} tay`;
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 2: PHÂN TÍCH CẦU 1-1 (ZIGZAG ANALYZER)
-// ==========================================================
-function analyzeZigzag(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '', zigzagCount: 0 };
-    if (!history || history.length < 4) return result;
-
-    const len = history.length;
-    const last = history[len - 1];
-    let zigzagCount = 0;
-
-    for (let i = len - 1; i >= 1; i--) {
-        if (history[i] !== history[i - 1]) zigzagCount++;
-        else break;
-    }
-
-    result.zigzagCount = zigzagCount;
-
-    if (zigzagCount >= 3) {
-        const score = zigzagCount * 10;
-        if (last === 'T') result.scoreX += score;
-        else result.scoreT += score;
-        result.reason = `Cầu đảo 1-1 (${zigzagCount} nhịp)`;
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 3: PHÂN TÍCH PATTERN 2-2 VÀ 3-3
-// ==========================================================
-function analyzePattern(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '' };
-    if (!history || history.length < 6) return result;
-
-    const last4 = history.slice(-4).join('');
-    const last6 = history.slice(-6).join('');
-    const last = history[history.length - 1];
-
-    if (last4 === 'TTXX' || last4 === 'XXTT') {
-        if (last === 'X') result.scoreT += 25;
-        else result.scoreX += 25;
-        result.reason = 'Pattern 2-2';
-    }
-    
-    if (last6 === 'TTTXXX' || last6 === 'XXXTTT') {
-        if (last === 'X') result.scoreT += 30;
-        else result.scoreX += 30;
-        result.reason = 'Pattern 3-3';
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 4: PATTERN MATRIX (TRUY VẾT QUÁ KHỨ)
-// ==========================================================
-function analyzeMatrix(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '', pastMatchT: 0, pastMatchX: 0 };
-    if (!history || history.length < 10) return result;
-
-    const len = history.length;
-    const lookbackPattern = history.slice(-5).join('');
-    let pastMatchT = 0, pastMatchX = 0;
-
-    for (let i = 0; i < len - 5; i++) {
-        if (history.slice(i, i + 5).join('') === lookbackPattern) {
-            if (history[i + 5] === 'T') pastMatchT++;
-            if (history[i + 5] === 'X') pastMatchX++;
-        }
-    }
-
-    result.pastMatchT = pastMatchT;
-    result.pastMatchX = pastMatchX;
-
-    if (pastMatchT > pastMatchX) {
-        result.scoreT += pastMatchT * 8;
-        result.reason = `Lịch sử báo Tài (${pastMatchT} lần)`;
-    } else if (pastMatchX > pastMatchT) {
-        result.scoreX += pastMatchX * 8;
-        result.reason = `Lịch sử báo Xỉu (${pastMatchX} lần)`;
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 5: XÚC XẮC TELEMETRY (BẮT MẠCH XÚC XẮC)
-// ==========================================================
-function analyzeDiceTelemetry(diceHistory) {
-    let result = { scoreT: 0, scoreX: 0, reason: '' };
-    if (!diceHistory || diceHistory.length < 3) return result;
-
-    const recentDices = diceHistory.slice(0, 3).map(d => d.point);
-    const allOdd = recentDices.every(p => p % 2 !== 0);
-    const allEven = recentDices.every(p => p % 2 === 0);
-
-    if (allOdd) {
-        result.scoreX += 15;
-        result.reason = '3 phiên toàn Tài lẻ';
-    }
-    if (allEven) {
-        result.scoreT += 15;
-        result.reason = '3 phiên toàn Xỉu chẵn';
-    }
-
-    const sumDice = recentDices.reduce((a, b) => a + b, 0);
-    if (sumDice > 38) {
-        result.scoreX += 10;
-        result.reason += ' + Tổng xúc xắc cao';
-    }
-    if (sumDice < 24) {
-        result.scoreT += 10;
-        result.reason += ' + Tổng xúc xắc thấp';
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 6: CÂN BẰNG (BÙ TRỪ)
-// ==========================================================
-function analyzeBalance(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '' };
-    if (!history || history.length < 15) return result;
-
-    const last15 = history.slice(-15);
-    const countT = last15.filter(x => x === 'T').length;
-    const countX = last15.filter(x => x === 'X').length;
-
-    if (countT > 10) {
-        result.scoreX += 20;
-        result.reason = 'Ép bù Xỉu (15 phiên nghiêng Tài)';
-    }
-    if (countX > 10) {
-        result.scoreT += 20;
-        result.reason = 'Ép bù Tài (15 phiên nghiêng Xỉu)';
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 7: FIBONACCI (DÃY SỐ VÀNG)
-// ==========================================================
-function analyzeFibonacci(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '' };
-    if (!history || history.length < 10) return result;
-
-    // Fibonacci: 1, 2, 3, 5, 8...
-    const fibPositions = [1, 2, 3, 5, 8];
-    let fibT = 0, fibX = 0;
-    const len = history.length;
-
-    for (let pos of fibPositions) {
-        if (len - pos >= 0) {
-            if (history[len - pos] === 'T') fibT++;
-            else fibX++;
-        }
-    }
-
-    if (fibT > fibX) {
-        result.scoreT += fibT * 5;
-        result.reason = 'Fibonacci ủng hộ Tài';
-    } else if (fibX > fibT) {
-        result.scoreX += fibX * 5;
-        result.reason = 'Fibonacci ủng hộ Xỉu';
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 8: MARKOV CHAIN (CHUỖI CHUYỂN ĐỔI)
-// ==========================================================
-function analyzeMarkovChain(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '' };
-    if (!history || history.length < 20) return result;
-
-    const len = history.length;
-    const last = history[len - 1];
-    let transTtoT = 0, transTtoX = 0;
-    let transXtoT = 0, transXtoX = 0;
-
-    for (let i = 0; i < len - 1; i++) {
-        if (history[i] === 'T' && history[i + 1] === 'T') transTtoT++;
-        if (history[i] === 'T' && history[i + 1] === 'X') transTtoX++;
-        if (history[i] === 'X' && history[i + 1] === 'T') transXtoT++;
-        if (history[i] === 'X' && history[i + 1] === 'X') transXtoX++;
-    }
-
-    if (last === 'T') {
-        if (transTtoT > transTtoX) {
-            result.scoreT += 15;
-            result.reason = `Markov: T->T (${transTtoT} lần)`;
-        } else {
-            result.scoreX += 15;
-            result.reason = `Markov: T->X (${transTtoX} lần)`;
-        }
-    } else {
-        if (transXtoX > transXtoT) {
-            result.scoreX += 15;
-            result.reason = `Markov: X->X (${transXtoX} lần)`;
-        } else {
-            result.scoreT += 15;
-            result.reason = `Markov: X->T (${transXtoT} lần)`;
-        }
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 9: PHÂN TÍCH NHỊP ĐỘ (RHYTHM ANALYZER)
-// ==========================================================
-function analyzeRhythm(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '' };
-    if (!history || history.length < 8) return result;
-
-    const len = history.length;
-    const recent8 = history.slice(-8);
-
-    // Tìm nhịp 3-1, 1-3
-    let countT = recent8.filter(x => x === 'T').length;
-    let countX = recent8.filter(x => x === 'X').length;
-
-    if (countT === 6 || countT === 7) {
-        result.scoreX += 12;
-        result.reason = 'Nhịp độ nghiêng Tài, báo Xỉu';
-    }
-    if (countX === 6 || countX === 7) {
-        result.scoreT += 12;
-        result.reason = 'Nhịp độ nghiêng Xỉu, báo Tài';
-    }
-
-    // Nhịp 2-2-2-2
-    const pattern = history.slice(-8).join('');
-    if (pattern === 'TTXXTTXX') {
-        result.scoreX += 20;
-        result.reason = 'Nhịp 2-2-2-2, báo Xỉu';
-    }
-    if (pattern === 'XXTTXXTT') {
-        result.scoreT += 20;
-        result.reason = 'Nhịp 2-2-2-2, báo Tài';
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TẦNG 10: CẢM BIẾN NHIỄU (ENTROPY SENSOR)
-// ==========================================================
-function analyzeEntropy(history) {
-    let result = { scoreT: 0, scoreX: 0, reason: '', entropy: 0 };
-    if (!history || history.length < 10) return result;
-
-    // Tính Entropy (độ nhiễu) dựa trên tần suất
-    const len = history.length;
-    const countT = history.filter(x => x === 'T').length;
-    const countX = history.filter(x => x === 'X').length;
-
-    const probT = countT / len;
-    const probX = countX / len;
-
-    // Entropy càng cao thì cầu càng nhiễu
-    let entropy = 0;
-    if (probT > 0) entropy -= probT * Math.log2(probT);
-    if (probX > 0) entropy -= probX * Math.log2(probX);
-
-    result.entropy = entropy;
-
-    // Nếu entropy cao (cầu nhiễu), bẻ nhịp
-    if (entropy > 0.9) {
-        const last = history[len - 1];
-        if (last === 'T') result.scoreX += 10;
-        else result.scoreT += 10;
-        result.reason = 'Entropy cao (Cầu nhiễu), bẻ nhịp';
-    }
-
-    return result;
-}
-
-// ==========================================================
-// TỔNG HỢP TẤT CẢ CÁC TẦNG (MAIN ALGORITHM)
-// ==========================================================
-function vipGodTierEngine(history, diceHistory) {
-    if (!history || history.length < CONFIG.MIN_PHIEN_REQUIRED) {
-        return { predict: 'CHỜ', confidence: '0%', reason: 'Chưa đủ dữ liệu' };
-    }
-
-    const last = history[history.length - 1];
-    let scoreT = 0;
-    let scoreX = 0;
-    let reasons = [];
-
-    // Chạy từng tầng phân tích
-    const t1 = analyzeStreak(history);
-    const t2 = analyzeZigzag(history);
-    const t3 = analyzePattern(history);
-    const t4 = analyzeMatrix(history);
-    const t5 = analyzeDiceTelemetry(diceHistory);
-    const t6 = analyzeBalance(history);
-    const t7 = analyzeFibonacci(history);
-    const t8 = analyzeMarkovChain(history);
-    const t9 = analyzeRhythm(history);
-    const t10 = analyzeEntropy(history);
-
-    // Cộng dồn điểm
-    scoreT += t1.scoreT + t2.scoreT + t3.scoreT + t4.scoreT + t5.scoreT + t6.scoreT + t7.scoreT + t8.scoreT + t9.scoreT + t10.scoreT;
-    scoreX += t1.scoreX + t2.scoreX + t3.scoreX + t4.scoreX + t5.scoreX + t6.scoreX + t7.scoreX + t8.scoreX + t9.scoreX + t10.scoreX;
-
-    // Thu thập lý do
-    if (t1.reason) reasons.push(t1.reason);
-    if (t2.reason) reasons.push(t2.reason);
-    if (t3.reason) reasons.push(t3.reason);
-    if (t4.reason) reasons.push(t4.reason);
-    if (t5.reason) reasons.push(t5.reason);
-    if (t6.reason) reasons.push(t6.reason);
-    if (t7.reason) reasons.push(t7.reason);
-    if (t8.reason) reasons.push(t8.reason);
-    if (t9.reason) reasons.push(t9.reason);
-    if (t10.reason) reasons.push(t10.reason);
-
-    // Chốt kết quả
-    let predict = 'TÀI';
-    let diff = scoreT - scoreX;
-
-    if (scoreX > scoreT) {
-        predict = 'XỈU';
-        diff = scoreX - scoreT;
-    } else if (scoreT === scoreX) {
-        predict = last === 'T' ? 'XỈU' : 'TÀI';
-        diff = 10;
-        reasons.push('Hòa điểm -> Bẻ nhịp');
-    }
-
-    // Tính tỉ lệ động (55% - 88%)
-    let confidence = 55;
-    if (diff >= 150) confidence = 88;      // Siêu chắc chắn (10 tầng đồng thuận)
-    else if (diff >= 120) confidence = 85; // Rất chắc
-    else if (diff >= 90) confidence = 80;  // Chắc
-    else if (diff >= 60) confidence = 75;  // Khá
-    else if (diff >= 40) confidence = 68;  // Trung bình
-    else if (diff >= 20) confidence = 60;  // Yếu
-    else confidence = 55;                  // Nhiễu
-
-    return {
-        predict,
-        confidence: `${confidence}%`,
-        reason: reasons.slice(0, 4).join(' + ') // Lấy tối đa 4 lý do
-    };
-}
-
-// ==========================================================
-// HÀM XỬ LÝ CHÍNH (TÍNH TOÁN & LƯU LỊCH SỬ)
-// ==========================================================
-async function processGame(apiUrl, gameType) {
-    const data = await fetchGameData(apiUrl);
-    if (!data || !data.list || data.list.length === 0) {
-        throw new Error("Không lấy được dữ liệu từ API");
-    }
-
-    const list = data.list;
-    const currentPhien = String(list[0].id);
-    
-    // Đảo ngược lịch sử để phân tích từ cũ đến mới
-    const history = list.map(item => item.resultTruyenThong === 'TAI' ? 'T' : 'X').reverse();
-    const diceHistory = list.map(item => ({ point: item.point, dices: item.dices }));
-
-    const mem = memory[gameType];
-
-    // 1. TỰ ĐỘNG TÍNH WIN/LOSE CỦA PHIÊN TRƯỚC
-    if (mem.lastPhien && parseFloat(currentPhien) > parseFloat(mem.lastPhien)) {
-        const actualObj = list.find(x => String(x.id) === mem.lastPhien);
-        if (actualObj && mem.lastPred) {
-            const actualStr = actualObj.resultTruyenThong === 'TAI' ? 'TÀI' : 'XỈU';
-            const isWin = (actualStr === mem.lastPred);
-            
-            // Lưu vào lịch sử
-            mem.history.push({
-                phien: mem.lastPhien,
-                duDoan: mem.lastPred,
-                ketQua: actualStr,
-                status: isWin ? 'WIN' : 'LOSE'
-            });
-
-            // Cập nhật thống kê
-            if (isWin) mem.totalWin++;
-            else mem.totalLose++;
-
-            // Giới hạn lịch sử
-            if (mem.history.length > CONFIG.MAX_HISTORY_STORE) {
-                mem.history.shift();
-            }
-
-            log('INFO', `[${gameType.toUpperCase()}] Phiên ${mem.lastPhien} -> Dự đoán: ${mem.lastPred} | KQ: ${actualStr} | ${isWin ? 'WIN' : 'LOSE'}`);
-        }
-    }
-
-    // 2. DỰ ĐOÁN PHIÊN TIẾP THEO
-    const prediction = vipGodTierEngine(history, diceHistory);
-
-    // 3. CẬP NHẬT BỘ NHỚ
-    mem.lastPhien = currentPhien;
-    mem.lastPred = prediction.predict;
-
-    log('DEBUG', `[${gameType.toUpperCase()}] Dự đoán phiên ${parseFloat(currentPhien) + 1}: ${prediction.predict} (${prediction.confidence})`);
-
-    return {
-        phienHienTai: currentPhien,
-        phienDuDoan: String(parseFloat(currentPhien) + 1),
-        duDoan: prediction.predict,
-        tiLe: prediction.confidence,
-        liDo: prediction.reason,
-        xucXac: list[0].dices || [],
-        tongDiem: list[0].point || 0
-    };
-}
-
-// ==========================================================
-// CÁC ROUTER API
-// ==========================================================
-
-// 1. API Dự đoán Tài Xỉu
 app.get('/taixiu', async (req, res) => {
-    try {
-        const result = await processGame(API_TX_URL, 'tx');
-        res.json({ status: "success", data: result });
-    } catch (error) {
-        log('ERROR', `Lỗi API /taixiu: ${error.message}`);
-        res.status(500).json({ status: "error", message: error.message });
-    }
+  try { res.json({ status: 'success', data: await processGame('tx') }); }
+  catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
 });
 
-// 2. API Dự đoán MD5
 app.get('/md5', async (req, res) => {
-    try {
-        const result = await processGame(API_MD5_URL, 'md5');
-        res.json({ status: "success", data: result });
-    } catch (error) {
-        log('ERROR', `Lỗi API /md5: ${error.message}`);
-        res.status(500).json({ status: "error", message: error.message });
-    }
+  try { res.json({ status: 'success', data: await processGame('md5') }); }
+  catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
 });
 
-// 3. API Lịch sử Tài Xỉu
 app.get('/lstaixiu', (req, res) => {
-    res.json({
-        status: "success",
-        totalWin: memory.tx.totalWin,
-        totalLose: memory.tx.totalLose,
-        data: memory.tx.history.reverse() // Đảo ngược để phiên mới nhất lên đầu
-    });
+  const m = memory.tx;
+  res.json({
+    status: 'success',
+    totalWin: m.totalWin, totalLose: m.totalLose,
+    winrate: m.totalWin + m.totalLose > 0
+      ? ((m.totalWin / (m.totalWin + m.totalLose)) * 100).toFixed(1) + '%' : '—',
+    bankroll: m.bankroll.toFixed(0),
+    maxDrawdown: m.maxDrawdown.toFixed(0),
+    stopped: m.stopped,
+    data: [...m.history].reverse()
+  });
 });
 
-// 4. API Lịch sử MD5
 app.get('/lsmd5', (req, res) => {
-    res.json({
-        status: "success",
-        totalWin: memory.md5.totalWin,
-        totalLose: memory.md5.totalLose,
-        data: memory.md5.history.reverse()
-    });
+  const m = memory.md5;
+  res.json({
+    status: 'success',
+    totalWin: m.totalWin, totalLose: m.totalLose,
+    winrate: m.totalWin + m.totalLose > 0
+      ? ((m.totalWin / (m.totalWin + m.totalLose)) * 100).toFixed(1) + '%' : '—',
+    bankroll: m.bankroll.toFixed(0),
+    maxDrawdown: m.maxDrawdown.toFixed(0),
+    stopped: m.stopped,
+    data: [...m.history].reverse()
+  });
 });
 
-// 5. API Kiểm tra trạng thái Server
 app.get('/status', (req, res) => {
-    res.json({
-        status: "online",
-        uptime: process.uptime(),
-        memory: process.memoryUsage(),
-        tx: { totalWin: memory.tx.totalWin, totalLose: memory.tx.totalLose },
-        md5: { totalWin: memory.md5.totalWin, totalLose: memory.md5.totalLose }
-    });
+  res.json({
+    status: 'online', version: '20.0.0',
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    tx: { win: memory.tx.totalWin, lose: memory.tx.totalLose, bankroll: memory.tx.bankroll, stopped: memory.tx.stopped },
+    md5: { win: memory.md5.totalWin, lose: memory.md5.totalLose, bankroll: memory.md5.bankroll, stopped: memory.md5.stopped }
+  });
+});
+
+app.get('/backtest', async (req, res) => {
+  try {
+    const type = req.query.type === 'md5' ? 'md5' : 'tx';
+    const limit = parseInt(req.query.limit) || 500;
+    const r = await runBacktest(type, limit);
+    res.json({ status: 'success', type, data: r });
+  } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
+});
+
+app.get('/backtest/:layer', async (req, res) => {
+  try {
+    const type = req.query.type === 'md5' ? 'md5' : 'tx';
+    const limit = parseInt(req.query.limit) || 500;
+    const r = await backtestLayer(type, req.params.layer, limit);
+    res.json({ status: 'success', data: r });
+  } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
+});
+
+app.get('/export', (req, res) => {
+  const type = req.query.type === 'md5' ? 'md5' : 'tx';
+  res.json({ status: 'success', data: memory[type].history });
+});
+
+app.post('/reset', (req, res) => {
+  const { type } = req.body;
+  if (type === 'tx' || type === 'all') memory.tx = defaultMem();
+  if (type === 'md5' || type === 'all') memory.md5 = defaultMem();
+  if (type === 'tx' || type === 'all') saveMem('tx');
+  if (type === 'md5' || type === 'all') saveMem('md5');
+  res.json({ status: 'success', message: `Reset ${type}` });
 });
 
 // ==========================================================
-// KHỞI ĐỘNG SERVER
+// 22. KHỞI ĐỘNG
 // ==========================================================
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log("=========================================");
-    console.log(`🔥 VIP GOD TIER SERVER V18 ĐANG CHẠY TẠI: http://localhost:${PORT}`);
-    console.log(`- Dự đoán Tài Xỉu: http://localhost:${PORT}/taixiu`);
-    console.log(`- Dự đoán MD5:     http://localhost:${PORT}/md5`);
-    console.log(`- Lịch sử Tài Xỉu: http://localhost:${PORT}/lstaixiu`);
-    console.log(`- Lịch sử MD5:     http://localhost:${PORT}/lsmd5`);
-    console.log(`- Trạng thái:      http://localhost:${PORT}/status`);
-    console.log("=========================================");
+const server = app.listen(CONFIG.PORT, () => {
+  console.log(COLORS.cyan + '=========================================');
+  console.log(COLORS.green + `🔥 VIP GOD TIER V20 — http://localhost:${CONFIG.PORT}`);
+  console.log(COLORS.cyan + '=========================================');
+  console.log(COLORS.yellow + 'Endpoints:');
+  console.log(COLORS.reset + '  GET  /taixiu                    → dự đoán TX');
+  console.log('  GET  /md5                       → dự đoán MD5');
+  console.log('  GET  /lstaixiu                  → lịch sử TX');
+  console.log('  GET  /lsmd5                     → lịch sử MD5');
+  console.log('  GET  /status                    → trạng thái');
+  console.log('  GET  /backtest?type=tx          → backtest tổng');
+  console.log('  GET  /backtest/:layer           → backtest từng tầng');
+  console.log('         layers: streak|zigzag|pattern|matrix|dice|');
+  console.log('                 balance|fibonacci|markov|rhythm|entropy|learner');
+  console.log('  GET  /export?type=tx            → xuất JSON');
+  console.log('  POST /reset                     → reset {type:"tx"|"md5"|"all"}');
+  console.log(COLORS.cyan + '=========================================');
+  console.log(COLORS.yellow + '⚠️  Tài Xỉu là sự kiện độc lập.');
+  console.log('   Backtest sẽ cho winrate ~50%. Đó là SỰ THẬT TOÁN HỌC.');
+  console.log(COLORS.cyan + '=========================================' + COLORS.reset);
+});
+
+process.on('SIGINT', () => {
+  log('INFO', 'Đang tắt server...');
+  saveMem('tx');
+  saveMem('md5');
+  server.close(() => process.exit(0));
 });
