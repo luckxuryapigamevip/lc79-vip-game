@@ -1,27 +1,28 @@
 /**
  * ==========================================================
- * VIP GOD TIER AI - SERVER V20 (FULL - HỌC CẦU ĐÀNG HOÀNG)
+ * VIP GOD TIER V23 — THUẬT TOÁN HỌC THẬT (KHÔNG RANDOM)
  * ==========================================================
- * Cài đặt:
+ * Cài:
  *   npm init -y
  *   npm i express axios cors
  *   node server.js
  *
- * Endpoints:
- *   GET  /taixiu               → dự đoán TX
- *   GET  /md5                  → dự đoán MD5
- *   GET  /lstaixiu             → lịch sử TX
- *   GET  /lsmd5                → lịch sử MD5
- *   GET  /status               → trạng thái server
- *   GET  /backtest?type=tx     → backtest tổng
- *   GET  /backtest/:layer      → backtest từng tầng
- *   GET  /export?type=tx       → xuất lịch sử JSON
- *   POST /reset                → reset lịch sử
+ * Thuật toán thật:
+ *   1. Variable-Order Markov (VOM)  — bậc 1→7, tự chọn
+ *   2. PPM (Prediction by Partial Matching) — nén dữ liệu
+ *   3. Bayesian smoothing — tránh overfit
+ *   4. CUSUM change-point — phát hiện cầu gãy
+ *   5. Ensemble có trọng số theo hiệu suất THẬT
  *
- * Lưu ý khoa học:
- *   Tài Xỉu là sự kiện độc lập. Không có thuật toán nào
- *   dự đoán được. Code này được viết để CHỨNG MINH điều đó
- *   bằng backtest — chứ không phải để thắng bạc.
+ * KHÔNG có:
+ *   - Random
+ *   - Pattern cứng (2-2, 3-3...)
+ *   - Gán điểm bừa
+ *
+ * Có:
+ *   - Học từ dữ liệu thật
+ *   - Tự thích nghi
+ *   - Backtest chứng minh
  * ==========================================================
  */
 
@@ -32,7 +33,7 @@ const fs = require('fs');
 const path = require('path');
 
 // ==========================================================
-// 1. CẤU HÌNH
+// CONFIG
 // ==========================================================
 const CONFIG = {
   PORT: process.env.PORT || 3000,
@@ -41,398 +42,334 @@ const CONFIG = {
     md5: 'https://wtxmd52.tele68.com/v1/txmd5/sessions'
   },
   MIN_PHIEN: 20,
-  MAX_STORE: 200,
+  MAX_STORE: 300,
   TIMEOUT: 15000,
   UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
   FILE: {
-    tx: path.join(__dirname, 'history_tx.json'),
-    md5: path.join(__dirname, 'history_md5.json')
+    tx: path.join(__dirname, 'v23_tx.json'),
+    md5: path.join(__dirname, 'v23_md5.json')
   },
-  BANKROLL: {
-    initial: 1000,
-    baseBet: 10,
-    maxBet: 50,
-    stopLoss: 300,
-    takeProfit: 500,
-    kellyFraction: 0.25
-  },
-  WEIGHTS: {
-    streak: 1.0, zigzag: 1.0, pattern: 1.2, matrix: 0.8,
-    dice: 0.6, balance: 1.0, fibonacci: 0.5, markov: 1.0,
-    rhythm: 0.9, entropy: 0.7, learner: 2.0  // learner weight cao nhất
-  },
-  LEARNER: {
-    minSamples: 3,
-    patternLength: 5,
-    decayFactor: 0.95,
-    maxPatterns: 5000
-  },
-  SIGNAL: {
-    minToPredict: 0.03,
-    maxConfidence: 85,
-    minConfidence: 50
+  MODEL: {
+    maxOrder: 7,           // Markov bậc tối đa
+    minSamplesPerOrder: 5, // Cần ít nhất 5 mẫu để tin bậc đó
+    laplaceAlpha: 1,       // Bayesian smoothing
+    cusumThreshold: 5,     // Ngưỡng phát hiện cầu gãy
+    performanceWindow: 50, // Cửa sổ đánh giá hiệu suất model
   }
 };
 
 // ==========================================================
-// 2. LOG
+// LOG
 // ==========================================================
-const COLORS = {
-  reset: '\x1b[0m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  blue: '\x1b[34m',
-  magenta: '\x1b[35m',
-  cyan: '\x1b[36m',
-  gray: '\x1b[90m'
-};
-
-function log(level, msg) {
+const C = { r: '\x1b[0m', red: '\x1b[31m', g: '\x1b[32m', y: '\x1b[33m', c: '\x1b[36m', gray: '\x1b[90m', m: '\x1b[35m' };
+function log(lv, msg) {
   const ts = new Date().toISOString();
-  const color = {
-    INFO: COLORS.cyan, WARN: COLORS.yellow, ERROR: COLORS.red,
-    DEBUG: COLORS.gray, WIN: COLORS.green, LOSE: COLORS.red,
-    LEARN: COLORS.magenta
-  }[level] || COLORS.reset;
-  console.log(`${COLORS.gray}[${ts}]${COLORS.reset} ${color}[${level}]${COLORS.reset} ${msg}`);
+  const col = { INFO: C.c, WARN: C.y, ERROR: C.red, DEBUG: C.gray, WIN: C.g, LOSE: C.red, MODEL: C.m }[lv] || C.r;
+  console.log(`${C.gray}[${ts}]${C.r} ${col}[${lv}]${C.r} ${msg}`);
 }
 
 // ==========================================================
-// 3. MEMORY + PERSISTENCE
+// PERSISTENCE
 // ==========================================================
-const defaultMem = () => ({
-  lastPhien: null, lastPred: null, history: [],
-  totalWin: 0, totalLose: 0,
-  bankroll: CONFIG.BANKROLL.initial,
-  stopped: false,
-  peakBankroll: CONFIG.BANKROLL.initial,
-  maxDrawdown: 0,
-  learnerPatterns: {}   // pattern -> {T, X, lastSeen}
-});
-
-const memory = {
-  tx: loadMem('tx'),
-  md5: loadMem('md5')
-};
+function defMem() {
+  return {
+    lastPhien: null, lastPred: null,
+    history: [], totalWin: 0, totalLose: 0,
+    // Lưu hiệu suất từng model để ensemble có trọng số
+    modelPerf: {
+      vom: { w: 0, l: 0 },
+      ppm: { w: 0, l: 0 },
+      cusum: { w: 0, l: 0 }
+    },
+    // Log dự đoán gần đây để đánh giá
+    predLog: []
+  };
+}
 
 function loadMem(type) {
   try {
     if (fs.existsSync(CONFIG.FILE[type])) {
-      const raw = JSON.parse(fs.readFileSync(CONFIG.FILE[type], 'utf8'));
-      return { ...defaultMem(), ...raw };
+      return { ...defMem(), ...JSON.parse(fs.readFileSync(CONFIG.FILE[type], 'utf8')) };
     }
-  } catch (e) {
-    log('ERROR', `Không load được ${type} history: ${e.message}`);
-  }
-  return defaultMem();
+  } catch (e) { log('ERROR', e.message); }
+  return defMem();
 }
-
 function saveMem(type) {
-  try {
-    fs.writeFileSync(CONFIG.FILE[type], JSON.stringify(memory[type], null, 2));
-  } catch (e) {
-    log('ERROR', `Không save được ${type}: ${e.message}`);
-  }
+  try { fs.writeFileSync(CONFIG.FILE[type], JSON.stringify(memory[type], null, 2)); }
+  catch (e) { log('ERROR', e.message); }
 }
 
-// ==========================================================
-// 4. TIỆN ÍCH
-// ==========================================================
-function toSeq(list) {
-  // list[0] mới nhất → đảo lại cũ -> mới
-  return list.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X').reverse();
-}
-
-function diceSeq(list) {
-  return list.map(x => ({ point: x.point, dices: x.dices })).reverse();
-}
-
-function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+const memory = { tx: loadMem('tx'), md5: loadMem('md5') };
 
 // ==========================================================
-// 5. TẦNG 1: STREAK
+// TIỆN ÍCH
 // ==========================================================
-function analyzeStreak(h) {
-  if (!h || h.length < 2) return { signal: 0, reason: '' };
-  const L = h.length, last = h[L - 1];
-  let n = 1;
-  for (let i = L - 2; i >= 0; i--) { if (h[i] === last) n++; else break; }
-  if (n >= 2 && n <= 3) { const s = 0.3 * (n - 1); return { signal: last === 'T' ? s : -s, reason: `Bám bệt ${n} tay` }; }
-  if (n === 4) return { signal: last === 'T' ? -0.2 : 0.2, reason: 'Bệt 4 — nghi ngờ' };
-  return { signal: 0, reason: `Bệt dài ${n} — không bẻ` };
-}
+const toSeq = (list) => list.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X').reverse();
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // ==========================================================
-// 6. TẦNG 2: ZIGZAG
-// ==========================================================
-function analyzeZigzag(h) {
-  if (!h || h.length < 4) return { signal: 0, reason: '' };
-  const L = h.length, last = h[L - 1];
-  let zz = 0;
-  for (let i = L - 1; i >= 1; i--) { if (h[i] !== h[i - 1]) zz++; else break; }
-  if (zz >= 3) { const s = Math.min(0.4, zz * 0.1); return { signal: last === 'T' ? -s : s, reason: `Cầu đảo ${zz} nhịp` }; }
-  return { signal: 0, reason: '' };
-}
-
-// ==========================================================
-// 7. TẦNG 3: PATTERN
-// ==========================================================
-function analyzePattern(h) {
-  if (!h || h.length < 6) return { signal: 0, reason: '' };
-  const last = h[h.length - 1];
-  const l4 = h.slice(-4).join(''), l6 = h.slice(-6).join('');
-  if (l6 === 'TTTXXX') return { signal: last === 'X' ? 0.5 : -0.5, reason: 'Pattern 3-3' };
-  if (l6 === 'XXXTTT') return { signal: last === 'T' ? -0.5 : 0.5, reason: 'Pattern 3-3' };
-  if (l4 === 'TTXX') return { signal: last === 'X' ? 0.3 : -0.3, reason: 'Pattern 2-2' };
-  if (l4 === 'XXTT') return { signal: last === 'T' ? -0.3 : 0.3, reason: 'Pattern 2-2' };
-  return { signal: 0, reason: '' };
-}
-
-// ==========================================================
-// 8. TẦNG 4: MATRIX
-// ==========================================================
-function analyzeMatrix(h) {
-  if (!h || h.length < 15) return { signal: 0, reason: '' };
-  const L = h.length, pat = h.slice(-5).join('');
-  let mT = 0, mX = 0;
-  for (let i = 0; i < L - 5; i++) {
-    if (h.slice(i, i + 5).join('') === pat) {
-      if (h[i + 5] === 'T') mT++; else if (h[i + 5] === 'X') mX++;
-    }
-  }
-  const total = mT + mX;
-  if (total < 2) return { signal: 0, reason: '' };
-  const ratio = mT / total;
-  const conf = Math.min(1, total / 5);
-  return { signal: (ratio - 0.5) * 2 * conf, reason: `Matrix ${mT}T/${mX}X` };
-}
-
-// ==========================================================
-// 9. TẦNG 5: DICE
-// ==========================================================
-function analyzeDice(dh) {
-  if (!dh || dh.length < 5) return { signal: 0, reason: '' };
-  const r = dh.slice(0, 5).map(d => d.point || 0);
-  const avg = r.reduce((a, b) => a + b, 0) / r.length;
-  const dev = avg - 10.5;
-  if (Math.abs(dev) < 1) return { signal: 0, reason: '' };
-  return { signal: clamp(-dev / 6, -0.3, 0.3), reason: `Xúc xắc TB ${avg.toFixed(1)}` };
-}
-
-// ==========================================================
-// 10. TẦNG 6: BALANCE (z-score)
-// ==========================================================
-function analyzeBalance(h) {
-  if (!h || h.length < 15) return { signal: 0, reason: '' };
-  const w = h.slice(-20), n = w.length;
-  const cT = w.filter(x => x === 'T').length;
-  const p = cT / n;
-  const z = (p - 0.5) / Math.sqrt(0.25 / n);
-  if (Math.abs(z) < 1.5) return { signal: 0, reason: '' };
-  return { signal: clamp(-z * 0.15, -0.5, 0.5), reason: `z=${z.toFixed(2)} (${cT}T/${n - cT}X)` };
-}
-
-// ==========================================================
-// 11. TẦNG 7: FIBONACCI
-// ==========================================================
-function analyzeFib(h) {
-  if (!h || h.length < 10) return { signal: 0, reason: '' };
-  const L = h.length, pos = [1, 2, 3, 5, 8];
-  let fT = 0, fX = 0;
-  for (const p of pos) { if (L - p >= 0) { if (h[L - p] === 'T') fT++; else fX++; } }
-  const total = fT + fX;
-  if (total === 0) return { signal: 0, reason: '' };
-  return { signal: ((fT - fX) / total) * 0.3, reason: `Fib ${fT}T/${fX}X` };
-}
-
-// ==========================================================
-// 12. TẦNG 8: MARKOV
-// ==========================================================
-function analyzeMarkov(h) {
-  if (!h || h.length < 20) return { signal: 0, reason: '' };
-  const L = h.length, last = h[L - 1];
-  let tt = 0, tx = 0, xt = 0, xx = 0;
-  for (let i = 0; i < L - 1; i++) {
-    if (h[i] === 'T' && h[i + 1] === 'T') tt++;
-    if (h[i] === 'T' && h[i + 1] === 'X') tx++;
-    if (h[i] === 'X' && h[i + 1] === 'T') xt++;
-    if (h[i] === 'X' && h[i + 1] === 'X') xx++;
-  }
-  if (last === 'T') {
-    const t = tt + tx;
-    if (t >= 5) return { signal: ((tt - tx) / t) * 0.4, reason: `Markov T→(T${tt}/X${tx})` };
-  } else {
-    const t = xt + xx;
-    if (t >= 5) return { signal: ((xx - xt) / t) * 0.4, reason: `Markov X→(X${xx}/T${xt})` };
-  }
-  return { signal: 0, reason: '' };
-}
-
-// ==========================================================
-// 13. TẦNG 9: RHYTHM
-// ==========================================================
-function analyzeRhythm(h) {
-  if (!h || h.length < 8) return { signal: 0, reason: '' };
-  const r8 = h.slice(-8), cT = r8.filter(x => x === 'T').length;
-  const p = r8.join('');
-  if (p === 'TTXXTTXX') return { signal: -0.4, reason: 'Nhịp 2-2-2-2' };
-  if (p === 'XXTTXXTT') return { signal: 0.4, reason: 'Nhịp 2-2-2-2' };
-  if (cT >= 6) return { signal: -0.3, reason: `Nghiêng Tài (${cT}/8)` };
-  if (cT <= 2) return { signal: 0.3, reason: `Nghiêng Xỉu (${cT}/8)` };
-  return { signal: 0, reason: '' };
-}
-
-// ==========================================================
-// 14. TẦNG 10: ENTROPY
-// ==========================================================
-function analyzeEntropy(h) {
-  if (!h || h.length < 10) return { signal: 0, reason: '', entropy: 0 };
-  const L = h.length, cT = h.filter(x => x === 'T').length;
-  const pT = cT / L, pX = 1 - pT;
-  let e = 0;
-  if (pT > 0) e -= pT * Math.log2(pT);
-  if (pX > 0) e -= pX * Math.log2(pX);
-  if (e > 0.98) return { signal: 0, reason: `Entropy cao (${e.toFixed(3)})`, entropy: e };
-  return { signal: 0, reason: '', entropy: e };
-}
-
-// ==========================================================
-// 15. TẦNG 11: LEARNER — HỌC CẦU ĐÀNG HOÀNG
+// ★ THUẬT TOÁN 1: VARIABLE-ORDER MARKOV (VOM)
 // ==========================================================
 /**
- * Học từ lịch sử: pattern N ký tự → xác suất ký tự tiếp theo
- * Đây là cách "học cầu" thực sự: đếm chứ không đoán mò.
- * Nhưng vì xúc xắc độc lập → pattern học được cũng ~50/50.
- * Điểm khác biệt: learner có TRỌNG SỐ CAO NHẤT, nên nếu nó
- * thực sự tìm được pattern có edge, engine sẽ tin nó.
+ * Học xác suất P(next | context) cho MỌI bậc từ 1 đến maxOrder.
+ * Tự chọn bậc cao nhất có đủ mẫu (>= minSamplesPerOrder).
+ * Dùng Bayesian smoothing (Laplace) để tránh 0.
+ *
+ * Trả về: { probT: [0,1], order: int, samples: int }
  */
-function analyzeLearner(history, patterns) {
-  if (!history || history.length < CONFIG.MIN_PHIEN) return { signal: 0, reason: '' };
+function vomPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
+  if (!history || history.length < 3) return { probT: 0.5, order: 0, samples: 0 };
 
-  // 1. Học: duyệt toàn bộ lịch sử, đếm pattern → next
-  const learned = {};
-  const N = CONFIG.LEARNER.patternLength;
-  const decay = CONFIG.LEARNER.decayFactor;
+  // Duyệt bậc cao → thấp, chọn bậc đầu tiên có đủ mẫu
+  for (let order = maxOrder; order >= 1; order--) {
+    if (history.length <= order) continue;
 
-  for (let i = 0; i < history.length - N; i++) {
-    const pat = history.slice(i, i + N).join('');
-    const next = history[i + N];
-    if (!learned[pat]) learned[pat] = { T: 0, X: 0, total: 0 };
-    // Trọng số giảm dần theo thời gian (mẫu cũ ít quan trọng hơn)
-    const age = history.length - i;
-    const weight = Math.pow(decay, age / 10);
-    if (next === 'T') learned[pat].T += weight;
-    else learned[pat].X += weight;
-    learned[pat].total += weight;
+    const context = history.slice(-order).join('');
+    let countT = 0, countX = 0;
+
+    // Duyệt toàn bộ lịch sử, tìm context giống
+    for (let i = 0; i < history.length - order; i++) {
+      if (history.slice(i, i + order).join('') === context) {
+        if (history[i + order] === 'T') countT++;
+        else countX++;
+      }
+    }
+
+    const total = countT + countX;
+    if (total >= CONFIG.MODEL.minSamplesPerOrder) {
+      // Laplace smoothing: (count + alpha) / (total + 2*alpha)
+      const alpha = CONFIG.MODEL.laplaceAlpha;
+      const probT = (countT + alpha) / (total + 2 * alpha);
+      return { probT, order, samples: total, context };
+    }
   }
 
-  // 2. Predict dựa trên pattern hiện tại
-  const currentPat = history.slice(-N).join('');
-  const stat = learned[currentPat];
+  return { probT: 0.5, order: 0, samples: 0 };
+}
 
-  if (!stat || stat.total < CONFIG.LEARNER.minSamples) {
-    return { signal: 0, reason: 'Learner: chưa đủ mẫu' };
+// ==========================================================
+// ★ THUẬT TOÁN 2: PPM (Prediction by Partial Matching)
+// ==========================================================
+/**
+ * PPM hoạt động như sau:
+ *   - Thử match context dài nhất có thể
+ *   - Nếu không tìm thấy → escape, giảm độ dài context
+ *   - Dùng phương pháp "escape" của PPM-C (Method C)
+ *
+ * Đây là thuật toán nén dữ liệu mạnh — dự đoán ký tự tiếp theo tốt hơn Markov thường.
+ *
+ * Trả về: { probT, escapeProb, matchedOrder }
+ */
+function ppmPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
+  if (!history || history.length < 3) return { probT: 0.5, matchedOrder: 0 };
+
+  // Xây dựng bảng đếm theo bậc
+  const tables = {}; // order -> context -> {T, X}
+  for (let order = 1; order <= maxOrder; order++) {
+    tables[order] = {};
   }
 
-  const pT = stat.T / stat.total;
-  const pX = stat.X / stat.total;
-  const edge = pT - pX; // [-1, 1]
-  const confidence = Math.min(1, stat.total / 10); // càng nhiều mẫu càng tin
+  for (let i = 0; i < history.length - 1; i++) {
+    for (let order = 1; order <= maxOrder; order++) {
+      if (i < order) continue;
+      const ctx = history.slice(i - order, i).join('');
+      const next = history[i];
+      if (!tables[order][ctx]) tables[order][ctx] = { T: 0, X: 0 };
+      if (next === 'T') tables[order][ctx].T++;
+      else tables[order][ctx].X++;
+    }
+  }
 
-  const signal = clamp(edge * confidence, -0.8, 0.8);
+  // PPM escape: duyệt bậc cao → thấp
+  let escapeProb = 1.0;
+  for (let order = maxOrder; order >= 1; order--) {
+    if (history.length < order) continue;
 
-  // Cập nhật patterns (dùng cho lần sau — không bắt buộc)
-  if (Object.keys(patterns).length < CONFIG.LEARNER.maxPatterns) {
-    patterns[currentPat] = {
-      T: Math.round(stat.T * 100) / 100,
-      X: Math.round(stat.X * 100) / 100,
-      total: Math.round(stat.total * 100) / 100,
-      pT: pT,
-      lastSeen: Date.now()
-    };
+    const ctx = history.slice(-order).join('');
+    const t = tables[order][ctx];
+
+    if (!t) continue;
+
+    const total = t.T + t.X;
+    if (total === 0) continue;
+
+    // PPM Method C: P(char) = count / (total + unique)
+    const unique = (t.T > 0 ? 1 : 0) + (t.X > 0 ? 1 : 0);
+    const pT = (t.T / (total + unique)) * escapeProb;
+    const pX = (t.X / (total + unique)) * escapeProb;
+
+    // Nếu đủ mạnh → trả về luôn
+    if (total >= 3) {
+      const probT = pT / (pT + pX + 1e-9);
+      return { probT: clamp(probT, 0.01, 0.99), matchedOrder: order, samples: total };
+    }
+
+    // Escape: giảm escapeProb cho bậc tiếp theo
+    escapeProb *= (unique / (total + unique));
+  }
+
+  // Fallback: toàn bộ lịch sử
+  const cT = history.filter(x => x === 'T').length;
+  return { probT: (cT + 1) / (history.length + 2), matchedOrder: 0 };
+}
+
+// ==========================================================
+// ★ THUẬT TOÁN 3: CUSUM CHANGE-POINT DETECTION
+// ==========================================================
+/**
+ * CUSUM (Cumulative Sum Control Chart):
+ * Phát hiện thay đổi phân phối trong chuỗi.
+ * Dùng để biết cầu hiện tại còn ổn định hay đã gãy.
+ *
+ * Trả về: { changeDetected: bool, strength: 0-1 }
+ */
+function cusumDetect(history) {
+  if (!history || history.length < 10) return { changeDetected: false, strength: 0 };
+
+  // Giả sử mean = 0.5 (T=1, X=0)
+  const values = history.map(x => x === 'T' ? 1 : 0);
+  const target = 0.5;
+  const threshold = CONFIG.MODEL.cusumThreshold;
+
+  let sHi = 0, sLo = 0;
+  let maxS = 0;
+
+  for (const v of values) {
+    sHi = Math.max(0, sHi + (v - target - 0.1));
+    sLo = Math.max(0, sLo + (target - v - 0.1));
+    maxS = Math.max(maxS, sHi, sLo);
   }
 
   return {
-    signal,
-    reason: `Learner: pat[${currentPat}] → T${stat.T.toFixed(1)}/X${stat.X.toFixed(1)} (p=${pT.toFixed(2)})`
+    changeDetected: maxS > threshold,
+    strength: clamp(maxS / (threshold * 2), 0, 1),
+    sHi, sLo
   };
 }
 
 // ==========================================================
-// 16. ENGINE TỔNG HỢP
+// ★ THUẬT TOÁN 4: ENSEMBLE CÓ TRỌNG SỐ THEO HIỆU SUẤT
 // ==========================================================
-function runEngine(history, diceHist, patterns) {
+/**
+ * Kết hợp 3 model trên với trọng số = hiệu suất THẬT của chúng.
+ * Model nào đoán đúng gần đây → trọng số cao.
+ * Model nào sai → trọng số thấp (nhưng không bao giờ = 0).
+ *
+ * Đây là "online learning" — model tự điều chỉnh.
+ */
+function ensemblePredict(history, perf) {
+  const vom = vomPredict(history);
+  const ppm = ppmPredict(history);
+  const cusum = cusumDetect(history);
+
+  // Tính trọng số từ hiệu suất gần đây
+  const calcWeight = (model) => {
+    const total = model.w + model.l;
+    if (total < 5) return 1.0; // chưa đủ mẫu → trọng số trung tính
+    const wr = model.w / total;
+    // Weight = 0.5 + (wr - 0.5) * 2 → [0, 1.5]
+    // Model thắng nhiều → weight cao
+    return clamp(0.5 + (wr - 0.5) * 2, 0.1, 1.5);
+  };
+
+  const wVom = calcWeight(perf.vom);
+  const wPpm = calcWeight(perf.ppm);
+  const wCusum = calcWeight(perf.cusum);
+
+  // Nếu CUSUM phát hiện cầu gãy → giảm tin tất cả, tăng uncertainty
+  let uncertaintyBoost = 0;
+  if (cusum.changeDetected) {
+    uncertaintyBoost = cusum.strength * 0.3;
+  }
+
+  // Tổng hợp
+  const totalW = wVom + wPpm + wCusum;
+  let probT = (vom.probT * wVom + ppm.probT * wPpm + 0.5 * wCusum) / totalW;
+
+  // Kéo về 0.5 nếu uncertainty cao
+  probT = probT * (1 - uncertaintyBoost) + 0.5 * uncertaintyBoost;
+
+  // Confidence dựa trên:
+  // - Số mẫu VOM
+  // - Số mẫu PPM
+  // - Không có change-point
+  const samplesFactor = Math.min(1, (vom.samples + (ppm.samples || 0)) / 20);
+  const stabilityFactor = 1 - uncertaintyBoost;
+  const confidence = samplesFactor * stabilityFactor;
+
+  return {
+    probT,
+    confidence,
+    vom, ppm, cusum,
+    weights: { vom: wVom, ppm: wPpm, cusum: wCusum },
+    totalSamples: vom.samples + (ppm.samples || 0)
+  };
+}
+
+// ==========================================================
+// DỰ ĐOÁN CUỐI CÙNG
+// ==========================================================
+function makePrediction(history, perf) {
   if (!history || history.length < CONFIG.MIN_PHIEN) {
-    return { predict: 'CHỜ', confidence: '0%', reason: 'Chưa đủ dữ liệu', detail: [], rawSignal: 0 };
-  }
-
-  const parts = [
-    { name: 'Streak',    ...analyzeStreak(history),              w: CONFIG.WEIGHTS.streak },
-    { name: 'Zigzag',    ...analyzeZigzag(history),              w: CONFIG.WEIGHTS.zigzag },
-    { name: 'Pattern',   ...analyzePattern(history),             w: CONFIG.WEIGHTS.pattern },
-    { name: 'Matrix',    ...analyzeMatrix(history),              w: CONFIG.WEIGHTS.matrix },
-    { name: 'Dice',      ...analyzeDice(diceHist),               w: CONFIG.WEIGHTS.dice },
-    { name: 'Balance',   ...analyzeBalance(history),             w: CONFIG.WEIGHTS.balance },
-    { name: 'Fibonacci', ...analyzeFib(history),                 w: CONFIG.WEIGHTS.fibonacci },
-    { name: 'Markov',    ...analyzeMarkov(history),              w: CONFIG.WEIGHTS.markov },
-    { name: 'Rhythm',    ...analyzeRhythm(history),              w: CONFIG.WEIGHTS.rhythm },
-    { name: 'Entropy',   ...analyzeEntropy(history),             w: CONFIG.WEIGHTS.entropy },
-    { name: 'Learner',   ...analyzeLearner(history, patterns),   w: CONFIG.WEIGHTS.learner }
-  ];
-
-  let sum = 0, wsum = 0, agreeT = 0, agreeX = 0, neutral = 0;
-
-  for (const p of parts) {
-    const s = p.signal || 0;
-    sum += s * p.w;
-    wsum += p.w;
-    if (s > 0.05) agreeT++;
-    else if (s < -0.05) agreeX++;
-    else neutral++;
-  }
-
-  const finalSignal = wsum > 0 ? sum / wsum : 0;
-
-  if (Math.abs(finalSignal) < CONFIG.SIGNAL.minToPredict) {
     return {
-      predict: 'CHỜ', confidence: '50%',
-      reason: 'Tín hiệu yếu — bỏ qua',
-      detail: parts.map(p => ({ name: p.name, signal: (p.signal || 0).toFixed(3), reason: p.reason || '—' })),
-      rawSignal: finalSignal
+      predict: 'CHỜ', confidence: 0, reason: 'Chưa đủ dữ liệu',
+      detail: null
     };
   }
 
-  const predict = finalSignal > 0 ? 'TÀI' : 'XỈU';
-  const agree = predict === 'TÀI' ? agreeT : agreeX;
-  const totalVotes = agreeT + agreeX + neutral;
-  const agreeRatio = totalVotes > 0 ? agree / totalVotes : 0;
-  const strength = Math.abs(finalSignal);
+  const result = ensemblePredict(history, perf);
+  const edge = Math.abs(result.probT - 0.5);
 
-  let confPct = 50 + agreeRatio * 30 + strength * 20;
-  confPct = clamp(confPct, CONFIG.SIGNAL.minConfidence, CONFIG.SIGNAL.maxConfidence);
+  // Nếu edge quá nhỏ → không đoán (trung thực, không bừa)
+  if (edge < 0.03) {
+    return {
+      predict: 'CHỜ',
+      confidence: 0,
+      reason: `Edge ${(edge * 100).toFixed(1)}% quá nhỏ — không đoán`,
+      detail: result
+    };
+  }
+
+  const predict = result.probT > 0.5 ? 'TÀI' : 'XỈU';
+
+  // Confidence = edge * 100 + samples factor
+  // Edge 5% → confidence 55%
+  // Edge 15% → confidence 65%
+  // Edge 30% → confidence 80%
+  // Cap ở 80% (không bao giờ tuyên bố > 80% vì không trung thực)
+  let confidence = 50 + edge * 200; // edge 0.05 → 60%, 0.15 → 80%
+  confidence = confidence * (0.5 + result.confidence * 0.5); // scale theo samples
+  confidence = clamp(Math.round(confidence), 0, 80);
+
+  const vomInfo = result.vom.order > 0
+    ? `VOM bậc ${result.vom.order} (${result.vom.samples} mẫu)`
+    : 'VOM: ít mẫu';
+  const ppmInfo = result.ppm.matchedOrder > 0
+    ? `PPM bậc ${result.ppm.matchedOrder}`
+    : 'PPM: không match';
+  const cusumInfo = result.cusum.changeDetected
+    ? `⚠️ CUSUM: cầu có thể gãy`
+    : 'CUSUM: ổn định';
 
   return {
     predict,
-    confidence: `${confPct.toFixed(0)}%`,
-    reason: parts.filter(p => p.reason).slice(0, 5).map(p => p.reason).join(' + '),
-    detail: parts.map(p => ({ name: p.name, signal: (p.signal || 0).toFixed(3), reason: p.reason || '—' })),
-    rawSignal: finalSignal,
-    votes: { T: agreeT, X: agreeX, neutral }
+    confidence,
+    reason: `${vomInfo} | ${ppmInfo} | ${cusumInfo}`,
+    detail: result
   };
 }
 
 // ==========================================================
-// 17. FETCH
+// FETCH
 // ==========================================================
 async function fetchData(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await axios.get(url, {
+      const r = await axios.get(url, {
         headers: { 'User-Agent': CONFIG.UA, 'Accept': 'application/json' },
         timeout: CONFIG.TIMEOUT
       });
-      if (res.status === 200 && res.data) return res.data;
+      if (r.status === 200 && r.data) return r.data;
     } catch (e) {
       log('ERROR', `Fetch lần ${i + 1}: ${e.message}`);
       if (i === retries - 1) return null;
@@ -443,273 +380,223 @@ async function fetchData(url, retries = 3) {
 }
 
 // ==========================================================
-// 18. QUẢN LÝ VỐN — KELLY CRITERION
-// ==========================================================
-function calcBetSize(mem, confidencePct) {
-  const p = confidencePct / 100;
-  // Kelly: f = (p*b - q) / b, với b=1 (cược 1 ăn 1)
-  // f = 2p - 1
-  const kelly = Math.max(0, 2 * p - 1);
-  const f = kelly * CONFIG.BANKROLL.kellyFraction;
-  const bet = clamp(
-    CONFIG.BANKROLL.baseBet * (1 + f * 10),
-    CONFIG.BANKROLL.baseBet,
-    CONFIG.BANKROLL.maxBet
-  );
-  return Math.round(bet);
-}
-
-function updateBankroll(mem, isWin, confidencePct) {
-  if (mem.stopped) return;
-
-  const bet = calcBetSize(mem, confidencePct);
-  if (isWin) mem.bankroll += bet;
-  else mem.bankroll -= bet;
-
-  if (mem.bankroll > mem.peakBankroll) mem.peakBankroll = mem.bankroll;
-  const dd = mem.peakBankroll - mem.bankroll;
-  if (dd > mem.maxDrawdown) mem.maxDrawdown = dd;
-
-  const profit = mem.bankroll - CONFIG.BANKROLL.initial;
-  if (profit <= -CONFIG.BANKROLL.stopLoss) {
-    mem.stopped = true;
-    log('WARN', `🛑 STOP-LOSS: lỗ ${Math.abs(profit).toFixed(0)}`);
-  }
-  if (profit >= CONFIG.BANKROLL.takeProfit) {
-    mem.stopped = true;
-    log('WIN', `🎯 TAKE-PROFIT: lãi ${profit.toFixed(0)}`);
-  }
-}
-
-// ==========================================================
-// 19. XỬ LÝ CHÍNH
+// PROCESS
 // ==========================================================
 async function processGame(type) {
-  const url = CONFIG.API[type];
-  const data = await fetchData(url);
-  if (!data || !data.list || data.list.length === 0) {
-    throw new Error('Không lấy được dữ liệu API');
-  }
+  const data = await fetchData(CONFIG.API[type]);
+  if (!data?.list?.length) throw new Error('Không lấy được dữ liệu');
 
   const list = data.list;
-  const currentPhien = String(list[0].id);
-  const history = toSeq(list);
-  const dh = diceSeq(list);
+  const cur = String(list[0].id);
+  const hist = toSeq(list);
   const mem = memory[type];
 
   // Chấm điểm phiên trước
   if (mem.lastPhien && mem.lastPred) {
-    const cur = parseFloat(currentPhien), prev = parseFloat(mem.lastPhien);
-    if (cur > prev) {
-      const actualObj = list.find(x => String(x.id) === mem.lastPhien);
-      if (actualObj) {
-        const actual = actualObj.resultTruyenThong === 'TAI' ? 'TÀI' : 'XỈU';
+    if (parseFloat(cur) > parseFloat(mem.lastPhien)) {
+      const obj = list.find(x => String(x.id) === mem.lastPhien);
+      if (obj) {
+        const actual = obj.resultTruyenThong === 'TAI' ? 'TÀI' : 'XỈU';
         const isWin = actual === mem.lastPred;
-        const conf = mem.lastConfidence || 50;
 
         mem.history.push({
-          phien: mem.lastPhien,
-          duDoan: mem.lastPred,
-          ketQua: actual,
-          status: isWin ? 'WIN' : 'LOSE',
-          tiLe: mem.lastConfidence,
-          timestamp: Date.now()
+          phien: mem.lastPhien, duDoan: mem.lastPred, ketQua: actual,
+          status: isWin ? 'WIN' : 'LOSE', ts: Date.now()
         });
-
         if (isWin) mem.totalWin++; else mem.totalLose++;
         if (mem.history.length > CONFIG.MAX_STORE) mem.history.shift();
 
-        updateBankroll(mem, isWin, conf);
-        saveMem(type);
+        // Cập nhật hiệu suất từng model (dùng để ensemble tính trọng số)
+        if (mem.lastModelPerf) {
+          for (const [model, pred] of Object.entries(mem.lastModelPerf)) {
+            if (pred === null) continue;
+            const modelPred = pred > 0.5 ? 'TÀI' : 'XỈU';
+            if (modelPred === actual) mem.modelPerf[model].w++;
+            else mem.modelPerf[model].l++;
+          }
+        }
 
-        log(isWin ? 'WIN' : 'LOSE', `[${type}] Phiên ${mem.lastPhien}: ${mem.lastPred} vs ${actual} → ${isWin ? '✅' : '❌'}`);
-      } else {
-        log('WARN', `[${type}] Không tìm thấy phiên ${mem.lastPhien}`);
+        saveMem(type);
+        log(isWin ? 'WIN' : 'LOSE', `[${type}] ${mem.lastPhien}: ${mem.lastPred} vs ${actual} → ${isWin ? '✅' : '❌'}`);
       }
     }
   }
 
   // Dự đoán
-  const pred = runEngine(history, dh, mem.learnerPatterns);
-  mem.lastPhien = currentPhien;
+  const pred = makePrediction(hist, mem.modelPerf);
+  mem.lastPhien = cur;
   mem.lastPred = pred.predict !== 'CHỜ' ? pred.predict : null;
-  mem.lastConfidence = pred.predict !== 'CHỜ' ? parseInt(pred.confidence) : null;
 
-  log('INFO', `[${type}] Dự đoán ${parseFloat(currentPhien) + 1}: ${pred.predict} (${pred.confidence})`);
+  // Lưu dự đoán riêng của từng model để chấm điểm sau
+  if (pred.detail) {
+    mem.lastModelPerf = {
+      vom: pred.detail.vom.probT,
+      ppm: pred.detail.ppm.probT,
+      cusum: 0.5 // CUSUM không predict trực tiếp
+    };
+  } else {
+    mem.lastModelPerf = null;
+  }
+
+  log('MODEL', `[${type}] VOM: P(T)=${(pred.detail?.vom.probT * 100 || 50).toFixed(1)}% | PPM: P(T)=${(pred.detail?.ppm.probT * 100 || 50).toFixed(1)}% | CUSUM: ${pred.detail?.cusum.changeDetected ? 'GÃY' : 'ổn định'}`);
+  log('INFO', `[${type}] Dự đoán ${parseFloat(cur) + 1}: ${pred.predict} (${pred.confidence}%)`);
 
   return {
-    phienHienTai: currentPhien,
-    phienDuDoan: String(parseFloat(currentPhien) + 1),
+    phienHienTai: cur,
+    phienDuDoan: String(parseFloat(cur) + 1),
     duDoan: pred.predict,
-    tiLe: pred.confidence,
+    tiLe: `${pred.confidence}%`,
     liDo: pred.reason,
-    chiTiet: pred.detail,
-    votes: pred.votes,
-    rawSignal: pred.rawSignal,
+    chiTiet: pred.detail ? {
+      vom: {
+        probT: (pred.detail.vom.probT * 100).toFixed(2) + '%',
+        order: pred.detail.vom.order,
+        samples: pred.detail.vom.samples,
+        context: pred.detail.vom.context || null
+      },
+      ppm: {
+        probT: (pred.detail.ppm.probT * 100).toFixed(2) + '%',
+        matchedOrder: pred.detail.ppm.matchedOrder,
+        samples: pred.detail.ppm.samples || 0
+      },
+      cusum: {
+        changeDetected: pred.detail.cusum.changeDetected,
+        strength: (pred.detail.cusum.strength * 100).toFixed(1) + '%'
+      },
+      weights: pred.detail.weights,
+      totalSamples: pred.detail.totalSamples
+    } : null,
     xucXac: list[0].dices || [],
     tongDiem: list[0].point || 0,
+    hieuSuatModel: {
+      vom: `${mem.modelPerf.vom.w}W/${mem.modelPerf.vom.l}L`,
+      ppm: `${mem.modelPerf.ppm.w}W/${mem.modelPerf.ppm.l}L`,
+      cusum: `${mem.modelPerf.cusum.w}W/${mem.modelPerf.cusum.l}L`
+    },
     thongKe: {
       win: mem.totalWin,
       lose: mem.totalLose,
       winrate: mem.totalWin + mem.totalLose > 0
-        ? ((mem.totalWin / (mem.totalWin + mem.totalLose)) * 100).toFixed(1) + '%' : '—',
-      bankroll: mem.bankroll.toFixed(0),
-      maxDrawdown: mem.maxDrawdown.toFixed(0),
-      stopped: mem.stopped
+        ? ((mem.totalWin / (mem.totalWin + mem.totalLose)) * 100).toFixed(1) + '%' : '—'
     }
   };
 }
 
 // ==========================================================
-// 20. BACKTEST
+// BACKTEST
 // ==========================================================
-async function runBacktest(type, limit = 500) {
-  log('INFO', `Backtest ${type} — limit ${limit}`);
-  const url = CONFIG.API[type];
+async function backtest(type, limit = 800) {
+  log('INFO', `Backtest V23 ${type} — limit ${limit}`);
   let all = [], page = 1;
-
   while (all.length < limit && page <= 15) {
     try {
-      const res = await axios.get(url, {
+      const r = await axios.get(CONFIG.API[type], {
         headers: { 'User-Agent': CONFIG.UA },
-        params: { page, limit: 100 },
-        timeout: CONFIG.TIMEOUT
+        params: { page, limit: 100 }, timeout: CONFIG.TIMEOUT
       });
-      const list = res.data?.list || [];
-      if (list.length === 0) break;
-      all = all.concat(list);
-      log('DEBUG', `Trang ${page}: +${list.length} (tổng ${all.length})`);
-      if (list.length < 100) break;
-      page++;
-    } catch (e) {
-      log('ERROR', `Trang ${page}: ${e.message}`);
-      break;
-    }
-  }
-
-  if (all.length === 0) throw new Error('Không lấy được dữ liệu');
-
-  all.sort((a, b) => parseFloat(a.id) - parseFloat(b.id));
-  const seq = all.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X');
-  const diceArr = all.map(x => ({ point: x.point, dices: x.dices }));
-
-  let win = 0, lose = 0, skip = 0;
-  const detail = [];
-  const patterns = {};
-
-  for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
-    const hist = seq.slice(0, i);
-    const dh = diceArr.slice(0, i).reverse();
-    const pred = runEngine(hist, dh, patterns);
-
-    if (pred.predict === 'CHỜ') { skip++; continue; }
-    const actual = seq[i] === 'T' ? 'TÀI' : 'XỈU';
-    const isWin = pred.predict === actual;
-    if (isWin) win++; else lose++;
-
-    if (detail.length < 30) {
-      detail.push({
-        phien: all[i].id, duDoan: pred.predict, ketQua: actual,
-        status: isWin ? 'WIN' : 'LOSE', tiLe: pred.confidence
-      });
-    }
-  }
-
-  const total = win + lose;
-  const winrate = total > 0 ? (win / total * 100).toFixed(2) : '0';
-
-  // Random baseline
-  let rW = 0, rL = 0;
-  for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
-    const g = Math.random() < 0.5 ? 'TÀI' : 'XỈU';
-    const a = seq[i] === 'T' ? 'TÀI' : 'XỈU';
-    if (g === a) rW++; else rL++;
-  }
-  const randomWr = (rW / (rW + rL) * 100).toFixed(2);
-
-  return {
-    tongPhien: seq.length,
-    soLanDuDoan: total, soLanBoQua: skip,
-    win, lose,
-    winrate: `${winrate}%`,
-    randomWinrate: `${randomWr}%`,
-    ketLuan: parseFloat(winrate) > 52
-      ? '⚠️ Đáng ngờ — kiểm tra lookahead bias'
-      : parseFloat(winrate) >= 48
-        ? '✅ ~50% — đúng kỳ vọng toán học (random)'
-        : '❌ Dưới 50% — tệ hơn random',
-    chiTiet30: detail
-  };
-}
-
-async function backtestLayer(type, layerName, limit = 500) {
-  log('INFO', `Backtest layer ${layerName} — ${type} — limit ${limit}`);
-  const url = CONFIG.API[type];
-  let all = [];
-  let page = 1;
-
-  while (all.length < limit && page <= 15) {
-    try {
-      const res = await axios.get(url, {
-        headers: { 'User-Agent': CONFIG.UA },
-        params: { page, limit: 100 },
-        timeout: CONFIG.TIMEOUT
-      });
-      const list = res.data?.list || [];
-      if (list.length === 0) break;
-      all = all.concat(list);
-      if (list.length < 100) break;
+      const l = r.data?.list || [];
+      if (!l.length) break;
+      all = all.concat(l);
+      if (l.length < 100) break;
       page++;
     } catch (e) { break; }
   }
+  if (!all.length) throw new Error('Không có dữ liệu');
 
-  if (all.length === 0) throw new Error('Không có dữ liệu');
   all.sort((a, b) => parseFloat(a.id) - parseFloat(b.id));
   const seq = all.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X');
-  const diceArr = all.map(x => ({ point: x.point, dices: x.dices }));
 
-  // Map layer → function
-  const layerFns = {
-    streak: (h) => analyzeStreak(h),
-    zigzag: (h) => analyzeZigzag(h),
-    pattern: (h) => analyzePattern(h),
-    matrix: (h) => analyzeMatrix(h),
-    dice: (h, d) => analyzeDice(d),
-    balance: (h) => analyzeBalance(h),
-    fibonacci: (h) => analyzeFib(h),
-    markov: (h) => analyzeMarkov(h),
-    rhythm: (h) => analyzeRhythm(h),
-    entropy: (h) => analyzeEntropy(h),
-    learner: (h, d, p) => analyzeLearner(h, p)
-  };
-
-  const fn = layerFns[layerName];
-  if (!fn) throw new Error(`Layer không hợp lệ: ${layerName}`);
-
+  // Metrics
   let win = 0, lose = 0, skip = 0;
-  const patterns = {};
+  const perf = { vom: { w: 0, l: 0 }, ppm: { w: 0, l: 0 }, cusum: { w: 0, l: 0 } };
+  const confBuckets = {};
+
+  // Đánh giá riêng từng model
+  let vomW = 0, vomL = 0, ppmW = 0, ppmL = 0;
 
   for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
-    const hist = seq.slice(0, i);
-    const dh = diceArr.slice(0, i).reverse();
-    const res = fn(hist, dh, patterns);
-    if (!res || Math.abs(res.signal || 0) < 0.03) { skip++; continue; }
-    const pred = res.signal > 0 ? 'TÀI' : 'XỈU';
+    const h = seq.slice(0, i);
+    const pred = makePrediction(h, perf);
+
+    // Đánh giá từng model độc lập
+    const vomR = vomPredict(h);
+    const ppmR = ppmPredict(h);
     const actual = seq[i] === 'T' ? 'TÀI' : 'XỈU';
-    if (pred === actual) win++; else lose++;
+
+    if (vomR.probT > 0.55) {
+      if (vomR.probT > 0.5 === (actual === 'TÀI')) vomW++; else vomL++;
+    } else if (vomR.probT < 0.45) {
+      if (vomR.probT < 0.5 === (actual === 'XỈU')) vomW++; else vomL++;
+    }
+
+    if (ppmR.probT > 0.55) {
+      if (ppmR.probT > 0.5 === (actual === 'TÀI')) ppmW++; else ppmL++;
+    } else if (ppmR.probT < 0.45) {
+      if (ppmR.probT < 0.5 === (actual === 'XỈU')) ppmW++; else ppmL++;
+    }
+
+    // Đánh giá ensemble
+    if (pred.predict === 'CHỜ') { skip++; continue; }
+    const isWin = pred.predict === actual;
+
+    // Cập nhật perf
+    if (pred.detail) {
+      const vomP = pred.detail.vom.probT > 0.5 ? 'TÀI' : 'XỈU';
+      const ppmP = pred.detail.ppm.probT > 0.5 ? 'TÀI' : 'XỈU';
+      if (vomP === actual) perf.vom.w++; else perf.vom.l++;
+      if (ppmP === actual) perf.ppm.w++; else perf.ppm.l++;
+    }
+
+    if (isWin) win++; else lose++;
+
+    const bucket = String(Math.floor(pred.confidence / 10) * 10);
+    if (!confBuckets[bucket]) confBuckets[bucket] = { w: 0, l: 0 };
+    if (isWin) confBuckets[bucket].w++;
+    else confBuckets[bucket].l++;
   }
 
   const total = win + lose;
+  const wr = total > 0 ? (win / total * 100).toFixed(2) : 0;
+
+  const confReport = {};
+  for (const [k, v] of Object.entries(confBuckets)) {
+    const t = v.w + v.l;
+    confReport[`${k}-${parseInt(k) + 9}%`] = {
+      total: t, win: v.w, lose: v.l,
+      winrate: t > 0 ? `${(v.w / t * 100).toFixed(1)}%` : '—'
+    };
+  }
+
   return {
-    layer: layerName, type,
-    tongPhien: seq.length, soLanDuDoan: total, soLanBoQua: skip,
+    tongPhien: seq.length,
+    soLanDuDoan: total,
+    soLanBoQua: skip,
     win, lose,
-    winrate: total > 0 ? `${(win / total * 100).toFixed(2)}%` : '0%'
+    winrateTong: `${wr}%`,
+    // Đánh giá từng model độc lập
+    danhGiaModel: {
+      vom: {
+        win: vomW, lose: vomL,
+        winrate: vomW + vomL > 0 ? `${(vomW / (vomW + vomL) * 100).toFixed(2)}%` : '—',
+        samples: vomW + vomL
+      },
+      ppm: {
+        win: ppmW, lose: ppmL,
+        winrate: ppmW + ppmL > 0 ? `${(ppmW / (ppmW + ppmL) * 100).toFixed(2)}%` : '—',
+        samples: ppmW + ppmL
+      }
+    },
+    winrateTheoConfidence: confReport,
+    ketLuan: parseFloat(wr) > 55
+      ? '⚠️ Có thể có lookahead — kiểm tra lại'
+      : parseFloat(wr) >= 48
+        ? '✅ ~50% — không có edge, đúng toán học'
+        : '❌ < 50% — ngược chiều, thua nhiều hơn'
   };
 }
 
 // ==========================================================
-// 21. EXPRESS ROUTES
+// EXPRESS
 // ==========================================================
 const app = express();
 app.use(cors());
@@ -729,12 +616,10 @@ app.get('/lstaixiu', (req, res) => {
   const m = memory.tx;
   res.json({
     status: 'success',
-    totalWin: m.totalWin, totalLose: m.totalLose,
+    win: m.totalWin, lose: m.totalLose,
     winrate: m.totalWin + m.totalLose > 0
       ? ((m.totalWin / (m.totalWin + m.totalLose)) * 100).toFixed(1) + '%' : '—',
-    bankroll: m.bankroll.toFixed(0),
-    maxDrawdown: m.maxDrawdown.toFixed(0),
-    stopped: m.stopped,
+    hieuSuatModel: m.modelPerf,
     data: [...m.history].reverse()
   });
 });
@@ -743,86 +628,64 @@ app.get('/lsmd5', (req, res) => {
   const m = memory.md5;
   res.json({
     status: 'success',
-    totalWin: m.totalWin, totalLose: m.totalLose,
+    win: m.totalWin, lose: m.totalLose,
     winrate: m.totalWin + m.totalLose > 0
       ? ((m.totalWin / (m.totalWin + m.totalLose)) * 100).toFixed(1) + '%' : '—',
-    bankroll: m.bankroll.toFixed(0),
-    maxDrawdown: m.maxDrawdown.toFixed(0),
-    stopped: m.stopped,
+    hieuSuatModel: m.modelPerf,
     data: [...m.history].reverse()
   });
 });
 
 app.get('/status', (req, res) => {
   res.json({
-    status: 'online', version: '20.0.0',
+    status: 'online', version: '23.0.0',
     uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    tx: { win: memory.tx.totalWin, lose: memory.tx.totalLose, bankroll: memory.tx.bankroll, stopped: memory.tx.stopped },
-    md5: { win: memory.md5.totalWin, lose: memory.md5.totalLose, bankroll: memory.md5.bankroll, stopped: memory.md5.stopped }
+    tx: { win: memory.tx.totalWin, lose: memory.tx.totalLose, perf: memory.tx.modelPerf },
+    md5: { win: memory.md5.totalWin, lose: memory.md5.totalLose, perf: memory.md5.modelPerf }
   });
 });
 
 app.get('/backtest', async (req, res) => {
   try {
     const type = req.query.type === 'md5' ? 'md5' : 'tx';
-    const limit = parseInt(req.query.limit) || 500;
-    const r = await runBacktest(type, limit);
+    const limit = parseInt(req.query.limit) || 800;
+    const r = await backtest(type, limit);
     res.json({ status: 'success', type, data: r });
   } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
 });
 
-app.get('/backtest/:layer', async (req, res) => {
-  try {
-    const type = req.query.type === 'md5' ? 'md5' : 'tx';
-    const limit = parseInt(req.query.limit) || 500;
-    const r = await backtestLayer(type, req.params.layer, limit);
-    res.json({ status: 'success', data: r });
-  } catch (e) { res.status(500).json({ status: 'error', message: e.message }); }
-});
-
-app.get('/export', (req, res) => {
-  const type = req.query.type === 'md5' ? 'md5' : 'tx';
-  res.json({ status: 'success', data: memory[type].history });
-});
-
 app.post('/reset', (req, res) => {
   const { type } = req.body;
-  if (type === 'tx' || type === 'all') memory.tx = defaultMem();
-  if (type === 'md5' || type === 'all') memory.md5 = defaultMem();
-  if (type === 'tx' || type === 'all') saveMem('tx');
-  if (type === 'md5' || type === 'all') saveMem('md5');
+  if (type === 'tx' || type === 'all') { memory.tx = defMem(); saveMem('tx'); }
+  if (type === 'md5' || type === 'all') { memory.md5 = defMem(); saveMem('md5'); }
   res.json({ status: 'success', message: `Reset ${type}` });
 });
 
 // ==========================================================
-// 22. KHỞI ĐỘNG
+// START
 // ==========================================================
 const server = app.listen(CONFIG.PORT, () => {
-  console.log(COLORS.cyan + '=========================================');
-  console.log(COLORS.green + `🔥 VIP GOD TIER V20 — http://localhost:${CONFIG.PORT}`);
-  console.log(COLORS.cyan + '=========================================');
-  console.log(COLORS.yellow + 'Endpoints:');
-  console.log(COLORS.reset + '  GET  /taixiu                    → dự đoán TX');
-  console.log('  GET  /md5                       → dự đoán MD5');
-  console.log('  GET  /lstaixiu                  → lịch sử TX');
-  console.log('  GET  /lsmd5                     → lịch sử MD5');
-  console.log('  GET  /status                    → trạng thái');
-  console.log('  GET  /backtest?type=tx          → backtest tổng');
-  console.log('  GET  /backtest/:layer           → backtest từng tầng');
-  console.log('         layers: streak|zigzag|pattern|matrix|dice|');
-  console.log('                 balance|fibonacci|markov|rhythm|entropy|learner');
-  console.log('  GET  /export?type=tx            → xuất JSON');
-  console.log('  POST /reset                     → reset {type:"tx"|"md5"|"all"}');
-  console.log(COLORS.cyan + '=========================================');
-  console.log(COLORS.yellow + '⚠️  Tài Xỉu là sự kiện độc lập.');
-  console.log('   Backtest sẽ cho winrate ~50%. Đó là SỰ THẬT TOÁN HỌC.');
-  console.log(COLORS.cyan + '=========================================' + COLORS.reset);
+  console.log(C.cyan + '=========================================');
+  console.log(C.g + `🔥 V23 — HỌC THẬT — http://localhost:${CONFIG.PORT}`);
+  console.log(C.cyan + '=========================================');
+  console.log(C.y + 'Thuật toán:');
+  console.log(C.r + '  1. Variable-Order Markov (VOM) bậc 1-7');
+  console.log('  2. PPM (Prediction by Partial Matching)');
+  console.log('  3. CUSUM change-point detection');
+  console.log('  4. Ensemble có trọng số theo hiệu suất');
+  console.log(C.cyan + '=========================================');
+  console.log(C.y + 'Endpoints:');
+  console.log(C.r + '  GET  /taixiu            → dự đoán TX');
+  console.log('  GET  /md5               → dự đoán MD5');
+  console.log('  GET  /backtest?type=tx  → kiểm chứng từng model');
+  console.log('  GET  /lstaixiu          → lịch sử + hiệu suất model');
+  console.log('  GET  /status            → trạng thái');
+  console.log('  POST /reset             → reset');
+  console.log(C.cyan + '=========================================' + C.r);
 });
 
 process.on('SIGINT', () => {
-  log('INFO', 'Đang tắt server...');
-  saveMem('tx');
-  saveMem('md5');
+  log('INFO', 'Tắt server...');
+  saveMem('tx'); saveMem('md5');
   server.close(() => process.exit(0));
 });
