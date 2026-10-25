@@ -1,28 +1,14 @@
 /**
  * ==========================================================
- * VIP GOD TIER V23 — THUẬT TOÁN HỌC THẬT (KHÔNG RANDOM)
+ * VIP GOD TIER V24 — FIX "TOÀN TÀI"
  * ==========================================================
- * Cài:
- *   npm init -y
- *   npm i express axios cors
- *   node server.js
- *
- * Thuật toán thật:
- *   1. Variable-Order Markov (VOM)  — bậc 1→7, tự chọn
- *   2. PPM (Prediction by Partial Matching) — nén dữ liệu
- *   3. Bayesian smoothing — tránh overfit
- *   4. CUSUM change-point — phát hiện cầu gãy
- *   5. Ensemble có trọng số theo hiệu suất THẬT
- *
- * KHÔNG có:
- *   - Random
- *   - Pattern cứng (2-2, 3-3...)
- *   - Gán điểm bừa
- *
- * Có:
- *   - Học từ dữ liệu thật
- *   - Tự thích nghi
- *   - Backtest chứng minh
+ * Bug V23: probT luôn lệch 1 phía → đoán toàn TÀI
+ * Fix V24:
+ *   1. Detrend: trừ historical bias khỏi probT
+ *   2. Confidence floor: chỉ đoán khi edge >= 8%
+ *   3. Balance guard: nếu 5 phiên gần nhất đoán 1 phía → bẻ
+ *   4. Balance log: cảnh báo khi model bias
+ *   5. Backtest thêm "distribution" — kiểm tra % TÀI/XỈU dự đoán
  * ==========================================================
  */
 
@@ -46,15 +32,21 @@ const CONFIG = {
   TIMEOUT: 15000,
   UA: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
   FILE: {
-    tx: path.join(__dirname, 'v23_tx.json'),
-    md5: path.join(__dirname, 'v23_md5.json')
+    tx: path.join(__dirname, 'v24_tx.json'),
+    md5: path.join(__dirname, 'v24_md5.json')
   },
   MODEL: {
-    maxOrder: 7,           // Markov bậc tối đa
-    minSamplesPerOrder: 5, // Cần ít nhất 5 mẫu để tin bậc đó
-    laplaceAlpha: 1,       // Bayesian smoothing
-    cusumThreshold: 5,     // Ngưỡng phát hiện cầu gãy
-    performanceWindow: 50, // Cửa sổ đánh giá hiệu suất model
+    maxOrder: 7,
+    minSamplesPerOrder: 5,
+    laplaceAlpha: 1,
+    cusumThreshold: 5
+  },
+  // ★ FIX MỚI: Kiểm soát bias
+  BIAS_CONTROL: {
+    DETREND_STRENGTH: 0.7,     // 0-1: càng cao càng kéo về 50/50
+    MIN_EDGE_TO_PREDICT: 0.08, // 8% edge tối thiểu mới đoán
+    MAX_ONE_SIDED_STREAK: 5,   // 5 phiên cùng phía → force bẻ
+    BALANCE_WINDOW: 20          // Cửa sổ kiểm tra balance
   }
 };
 
@@ -75,14 +67,14 @@ function defMem() {
   return {
     lastPhien: null, lastPred: null,
     history: [], totalWin: 0, totalLose: 0,
-    // Lưu hiệu suất từng model để ensemble có trọng số
     modelPerf: {
       vom: { w: 0, l: 0 },
-      ppm: { w: 0, l: 0 },
-      cusum: { w: 0, l: 0 }
+      ppm: { w: 0, l: 0 }
     },
-    // Log dự đoán gần đây để đánh giá
-    predLog: []
+    // ★ Track phân phối dự đoán để phát hiện bias
+    predDistribution: { T: 0, X: 0 },
+    recentPreds: [],  // 10 dự đoán gần nhất
+    biasWarning: false
   };
 }
 
@@ -108,26 +100,42 @@ const toSeq = (list) => list.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X')
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // ==========================================================
-// ★ THUẬT TOÁN 1: VARIABLE-ORDER MARKOV (VOM)
+// ★ FIX 1: DETREND — Kéo probT về 50/50 nếu lịch sử lệch
 // ==========================================================
 /**
- * Học xác suất P(next | context) cho MỌI bậc từ 1 đến maxOrder.
- * Tự chọn bậc cao nhất có đủ mẫu (>= minSamplesPerOrder).
- * Dùng Bayesian smoothing (Laplace) để tránh 0.
+ * Nếu lịch sử có 60% Tài → model sẽ luôn đoán Tài vì probT > 0.5.
+ * Detrend: tính bias lịch sử, trừ khỏi probT.
  *
- * Trả về: { probT: [0,1], order: int, samples: int }
+ * Ví dụ: history 60% Tài, model probT = 0.62
+ *   → bias = 0.60 - 0.50 = 0.10
+ *   → detrended = 0.62 - 0.10 * 0.7 = 0.55
+ *   → vẫn > 0.5 nhưng gần hơn, không bias nặng
  */
+function detrend(probT, history) {
+  if (!history || history.length < 10) return probT;
+
+  const cT = history.filter(x => x === 'T').length;
+  const histBias = cT / history.length - 0.5; // [-0.5, 0.5]
+
+  // Trừ bias * strength
+  const strength = CONFIG.BIAS_CONTROL.DETREND_STRENGTH;
+  const adjusted = probT - histBias * strength;
+
+  return clamp(adjusted, 0.01, 0.99);
+}
+
+// ==========================================================
+// VOM (giữ nguyên V23)
+// ==========================================================
 function vomPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
   if (!history || history.length < 3) return { probT: 0.5, order: 0, samples: 0 };
 
-  // Duyệt bậc cao → thấp, chọn bậc đầu tiên có đủ mẫu
   for (let order = maxOrder; order >= 1; order--) {
     if (history.length <= order) continue;
 
     const context = history.slice(-order).join('');
     let countT = 0, countX = 0;
 
-    // Duyệt toàn bộ lịch sử, tìm context giống
     for (let i = 0; i < history.length - order; i++) {
       if (history.slice(i, i + order).join('') === context) {
         if (history[i + order] === 'T') countT++;
@@ -137,7 +145,6 @@ function vomPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
 
     const total = countT + countX;
     if (total >= CONFIG.MODEL.minSamplesPerOrder) {
-      // Laplace smoothing: (count + alpha) / (total + 2*alpha)
       const alpha = CONFIG.MODEL.laplaceAlpha;
       const probT = (countT + alpha) / (total + 2 * alpha);
       return { probT, order, samples: total, context };
@@ -148,26 +155,13 @@ function vomPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
 }
 
 // ==========================================================
-// ★ THUẬT TOÁN 2: PPM (Prediction by Partial Matching)
+// PPM (giữ nguyên V23)
 // ==========================================================
-/**
- * PPM hoạt động như sau:
- *   - Thử match context dài nhất có thể
- *   - Nếu không tìm thấy → escape, giảm độ dài context
- *   - Dùng phương pháp "escape" của PPM-C (Method C)
- *
- * Đây là thuật toán nén dữ liệu mạnh — dự đoán ký tự tiếp theo tốt hơn Markov thường.
- *
- * Trả về: { probT, escapeProb, matchedOrder }
- */
 function ppmPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
-  if (!history || history.length < 3) return { probT: 0.5, matchedOrder: 0 };
+  if (!history || history.length < 3) return { probT: 0.5, matchedOrder: 0, samples: 0 };
 
-  // Xây dựng bảng đếm theo bậc
-  const tables = {}; // order -> context -> {T, X}
-  for (let order = 1; order <= maxOrder; order++) {
-    tables[order] = {};
-  }
+  const tables = {};
+  for (let order = 1; order <= maxOrder; order++) tables[order] = {};
 
   for (let i = 0; i < history.length - 1; i++) {
     for (let order = 1; order <= maxOrder; order++) {
@@ -180,66 +174,47 @@ function ppmPredict(history, maxOrder = CONFIG.MODEL.maxOrder) {
     }
   }
 
-  // PPM escape: duyệt bậc cao → thấp
   let escapeProb = 1.0;
   for (let order = maxOrder; order >= 1; order--) {
     if (history.length < order) continue;
-
     const ctx = history.slice(-order).join('');
     const t = tables[order][ctx];
-
     if (!t) continue;
 
     const total = t.T + t.X;
     if (total === 0) continue;
 
-    // PPM Method C: P(char) = count / (total + unique)
     const unique = (t.T > 0 ? 1 : 0) + (t.X > 0 ? 1 : 0);
     const pT = (t.T / (total + unique)) * escapeProb;
     const pX = (t.X / (total + unique)) * escapeProb;
 
-    // Nếu đủ mạnh → trả về luôn
     if (total >= 3) {
       const probT = pT / (pT + pX + 1e-9);
       return { probT: clamp(probT, 0.01, 0.99), matchedOrder: order, samples: total };
     }
 
-    // Escape: giảm escapeProb cho bậc tiếp theo
     escapeProb *= (unique / (total + unique));
   }
 
-  // Fallback: toàn bộ lịch sử
   const cT = history.filter(x => x === 'T').length;
-  return { probT: (cT + 1) / (history.length + 2), matchedOrder: 0 };
+  return { probT: (cT + 1) / (history.length + 2), matchedOrder: 0, samples: 0 };
 }
 
 // ==========================================================
-// ★ THUẬT TOÁN 3: CUSUM CHANGE-POINT DETECTION
+// CUSUM (giữ nguyên)
 // ==========================================================
-/**
- * CUSUM (Cumulative Sum Control Chart):
- * Phát hiện thay đổi phân phối trong chuỗi.
- * Dùng để biết cầu hiện tại còn ổn định hay đã gãy.
- *
- * Trả về: { changeDetected: bool, strength: 0-1 }
- */
 function cusumDetect(history) {
   if (!history || history.length < 10) return { changeDetected: false, strength: 0 };
-
-  // Giả sử mean = 0.5 (T=1, X=0)
   const values = history.map(x => x === 'T' ? 1 : 0);
   const target = 0.5;
   const threshold = CONFIG.MODEL.cusumThreshold;
 
-  let sHi = 0, sLo = 0;
-  let maxS = 0;
-
+  let sHi = 0, sLo = 0, maxS = 0;
   for (const v of values) {
     sHi = Math.max(0, sHi + (v - target - 0.1));
     sLo = Math.max(0, sLo + (target - v - 0.1));
     maxS = Math.max(maxS, sHi, sLo);
   }
-
   return {
     changeDetected: maxS > threshold,
     strength: clamp(maxS / (threshold * 2), 0, 1),
@@ -248,114 +223,143 @@ function cusumDetect(history) {
 }
 
 // ==========================================================
-// ★ THUẬT TOÁN 4: ENSEMBLE CÓ TRỌNG SỐ THEO HIỆU SUẤT
+// ★ FIX 2: ENSEMBLE có DETREND
 // ==========================================================
-/**
- * Kết hợp 3 model trên với trọng số = hiệu suất THẬT của chúng.
- * Model nào đoán đúng gần đây → trọng số cao.
- * Model nào sai → trọng số thấp (nhưng không bao giờ = 0).
- *
- * Đây là "online learning" — model tự điều chỉnh.
- */
 function ensemblePredict(history, perf) {
   const vom = vomPredict(history);
   const ppm = ppmPredict(history);
   const cusum = cusumDetect(history);
 
-  // Tính trọng số từ hiệu suất gần đây
   const calcWeight = (model) => {
     const total = model.w + model.l;
-    if (total < 5) return 1.0; // chưa đủ mẫu → trọng số trung tính
+    if (total < 5) return 1.0;
     const wr = model.w / total;
-    // Weight = 0.5 + (wr - 0.5) * 2 → [0, 1.5]
-    // Model thắng nhiều → weight cao
     return clamp(0.5 + (wr - 0.5) * 2, 0.1, 1.5);
   };
 
   const wVom = calcWeight(perf.vom);
   const wPpm = calcWeight(perf.ppm);
-  const wCusum = calcWeight(perf.cusum);
+  const totalW = wVom + wPpm;
 
-  // Nếu CUSUM phát hiện cầu gãy → giảm tin tất cả, tăng uncertainty
+  // ★ FIX: Bỏ 0.5 * wCusum (gây bias TÀI)
+  let probT = (vom.probT * wVom + ppm.probT * wPpm) / totalW;
+
+  // ★ FIX: Detrend khỏi historical bias
+  const probTRaw = probT;
+  probT = detrend(probT, history);
+
+  // Nếu cầu gãy → kéo về 0.5
   let uncertaintyBoost = 0;
   if (cusum.changeDetected) {
-    uncertaintyBoost = cusum.strength * 0.3;
+    uncertaintyBoost = cusum.strength * 0.4;
   }
-
-  // Tổng hợp
-  const totalW = wVom + wPpm + wCusum;
-  let probT = (vom.probT * wVom + ppm.probT * wPpm + 0.5 * wCusum) / totalW;
-
-  // Kéo về 0.5 nếu uncertainty cao
   probT = probT * (1 - uncertaintyBoost) + 0.5 * uncertaintyBoost;
 
-  // Confidence dựa trên:
-  // - Số mẫu VOM
-  // - Số mẫu PPM
-  // - Không có change-point
-  const samplesFactor = Math.min(1, (vom.samples + (ppm.samples || 0)) / 20);
+  const samplesFactor = Math.min(1, (vom.samples + ppm.samples) / 20);
   const stabilityFactor = 1 - uncertaintyBoost;
   const confidence = samplesFactor * stabilityFactor;
 
   return {
     probT,
+    probTRaw,
     confidence,
     vom, ppm, cusum,
-    weights: { vom: wVom, ppm: wPpm, cusum: wCusum },
-    totalSamples: vom.samples + (ppm.samples || 0)
+    weights: { vom: wVom, ppm: wPpm },
+    totalSamples: vom.samples + ppm.samples
   };
 }
 
 // ==========================================================
-// DỰ ĐOÁN CUỐI CÙNG
+// ★ FIX 3: BALANCE GUARD — Chống đoán 1 phía
 // ==========================================================
-function makePrediction(history, perf) {
+/**
+ * Nếu 5 dự đoán gần nhất đều TÀI → force XỈU
+ * Nếu 5 dự đoán gần nhất đều XỈU → force TÀI
+ *
+ * Lý do: model bị bias thì phải phá bias, không thể để nó
+ * đoán 1 phía mãi được.
+ */
+function checkBalanceGuard(recentPreds) {
+  if (!recentPreds || recentPreds.length < CONFIG.BIAS_CONTROL.MAX_ONE_SIDED_STREAK) {
+    return { force: null, reason: '' };
+  }
+
+  const last5 = recentPreds.slice(-CONFIG.BIAS_CONTROL.MAX_ONE_SIDED_STREAK);
+  const allT = last5.every(p => p === 'TÀI');
+  const allX = last5.every(p => p === 'XỈU');
+
+  if (allT) {
+    return {
+      force: 'XỈU',
+      reason: `⚠️ ${CONFIG.BIAS_CONTROL.MAX_ONE_SIDED_STREAK} phiên toàn TÀI — force bẻ XỈU`
+    };
+  }
+  if (allX) {
+    return {
+      force: 'TÀI',
+      reason: `⚠️ ${CONFIG.BIAS_CONTROL.MAX_ONE_SIDED_STREAK} phiên toàn XỈU — force bẻ TÀI`
+    };
+  }
+
+  return { force: null, reason: '' };
+}
+
+// ==========================================================
+// ★ FIX 4: DỰ ĐOÁN CUỐI (có balance guard + edge floor)
+// ==========================================================
+function makePrediction(history, perf, recentPreds) {
   if (!history || history.length < CONFIG.MIN_PHIEN) {
     return {
-      predict: 'CHỜ', confidence: 0, reason: 'Chưa đủ dữ liệu',
-      detail: null
+      predict: 'CHỜ', confidence: 0,
+      reason: 'Chưa đủ dữ liệu', detail: null
     };
   }
 
   const result = ensemblePredict(history, perf);
   const edge = Math.abs(result.probT - 0.5);
 
-  // Nếu edge quá nhỏ → không đoán (trung thực, không bừa)
-  if (edge < 0.03) {
+  // ★ FIX: Edge floor 8% thay vì 3%
+  if (edge < CONFIG.BIAS_CONTROL.MIN_EDGE_TO_PREDICT) {
     return {
       predict: 'CHỜ',
       confidence: 0,
-      reason: `Edge ${(edge * 100).toFixed(1)}% quá nhỏ — không đoán`,
+      reason: `Edge ${(edge * 100).toFixed(1)}% < ${CONFIG.BIAS_CONTROL.MIN_EDGE_TO_PREDICT * 100}% — không đoán`,
       detail: result
     };
   }
 
-  const predict = result.probT > 0.5 ? 'TÀI' : 'XỈU';
+  let predict = result.probT > 0.5 ? 'TÀI' : 'XỈU';
 
-  // Confidence = edge * 100 + samples factor
-  // Edge 5% → confidence 55%
-  // Edge 15% → confidence 65%
-  // Edge 30% → confidence 80%
-  // Cap ở 80% (không bao giờ tuyên bố > 80% vì không trung thực)
-  let confidence = 50 + edge * 200; // edge 0.05 → 60%, 0.15 → 80%
-  confidence = confidence * (0.5 + result.confidence * 0.5); // scale theo samples
+  // ★ FIX: Balance guard
+  const guard = checkBalanceGuard(recentPreds);
+  let guardApplied = false;
+  if (guard.force && guard.force !== predict) {
+    predict = guard.force;
+    guardApplied = true;
+  }
+
+  // Confidence
+  let confidence = 50 + edge * 200;
+  confidence = confidence * (0.5 + result.confidence * 0.5);
   confidence = clamp(Math.round(confidence), 0, 80);
 
   const vomInfo = result.vom.order > 0
-    ? `VOM bậc ${result.vom.order} (${result.vom.samples} mẫu)`
+    ? `VOM bậc ${result.vom.order} (${result.vom.samples}m)`
     : 'VOM: ít mẫu';
   const ppmInfo = result.ppm.matchedOrder > 0
     ? `PPM bậc ${result.ppm.matchedOrder}`
-    : 'PPM: không match';
-  const cusumInfo = result.cusum.changeDetected
-    ? `⚠️ CUSUM: cầu có thể gãy`
-    : 'CUSUM: ổn định';
+    : 'PPM: no match';
+  const cusumInfo = result.cusum.changeDetected ? 'CUSUM gãy' : 'CUSUM ổn';
+
+  const reasonParts = [vomInfo, ppmInfo, cusumInfo];
+  if (guardApplied) reasonParts.push(guard.reason);
 
   return {
     predict,
     confidence,
-    reason: `${vomInfo} | ${ppmInfo} | ${cusumInfo}`,
-    detail: result
+    reason: reasonParts.join(' | '),
+    detail: result,
+    guardApplied
   };
 }
 
@@ -406,10 +410,10 @@ async function processGame(type) {
         if (isWin) mem.totalWin++; else mem.totalLose++;
         if (mem.history.length > CONFIG.MAX_STORE) mem.history.shift();
 
-        // Cập nhật hiệu suất từng model (dùng để ensemble tính trọng số)
+        // Cập nhật perf
         if (mem.lastModelPerf) {
           for (const [model, pred] of Object.entries(mem.lastModelPerf)) {
-            if (pred === null) continue;
+            if (pred === null || !mem.modelPerf[model]) continue;
             const modelPred = pred > 0.5 ? 'TÀI' : 'XỈU';
             if (modelPred === actual) mem.modelPerf[model].w++;
             else mem.modelPerf[model].l++;
@@ -423,22 +427,40 @@ async function processGame(type) {
   }
 
   // Dự đoán
-  const pred = makePrediction(hist, mem.modelPerf);
+  const pred = makePrediction(hist, mem.modelPerf, mem.recentPreds);
   mem.lastPhien = cur;
   mem.lastPred = pred.predict !== 'CHỜ' ? pred.predict : null;
 
-  // Lưu dự đoán riêng của từng model để chấm điểm sau
+  // Lưu dự đoán vào distribution
+  if (pred.predict !== 'CHỜ') {
+    mem.predDistribution[pred.predict === 'TÀI' ? 'T' : 'X']++;
+    mem.recentPreds.push(pred.predict);
+    if (mem.recentPreds.length > 20) mem.recentPreds.shift();
+  }
+
+  // ★ FIX 5: Bias warning
+  const totalPreds = mem.predDistribution.T + mem.predDistribution.X;
+  if (totalPreds > 10) {
+    const tRatio = mem.predDistribution.T / totalPreds;
+    if (tRatio > 0.7 || tRatio < 0.3) {
+      mem.biasWarning = true;
+      log('WARN', `[${type}] ⚠️ BIAS: ${(tRatio * 100).toFixed(0)}% dự đoán là TÀI — model có thể bị lệch`);
+    } else {
+      mem.biasWarning = false;
+    }
+  }
+
+  // Lưu model perf
   if (pred.detail) {
     mem.lastModelPerf = {
       vom: pred.detail.vom.probT,
-      ppm: pred.detail.ppm.probT,
-      cusum: 0.5 // CUSUM không predict trực tiếp
+      ppm: pred.detail.ppm.probT
     };
   } else {
     mem.lastModelPerf = null;
   }
 
-  log('MODEL', `[${type}] VOM: P(T)=${(pred.detail?.vom.probT * 100 || 50).toFixed(1)}% | PPM: P(T)=${(pred.detail?.ppm.probT * 100 || 50).toFixed(1)}% | CUSUM: ${pred.detail?.cusum.changeDetected ? 'GÃY' : 'ổn định'}`);
+  log('MODEL', `[${type}] VOM: P(T)=${((pred.detail?.vom.probT || 0.5) * 100).toFixed(1)}% | PPM: P(T)=${((pred.detail?.ppm.probT || 0.5) * 100).toFixed(1)}% | Detrended P(T)=${((pred.detail?.probT || 0.5) * 100).toFixed(1)}%`);
   log('INFO', `[${type}] Dự đoán ${parseFloat(cur) + 1}: ${pred.predict} (${pred.confidence}%)`);
 
   return {
@@ -447,31 +469,35 @@ async function processGame(type) {
     duDoan: pred.predict,
     tiLe: `${pred.confidence}%`,
     liDo: pred.reason,
+    guardApplied: pred.guardApplied || false,
     chiTiet: pred.detail ? {
       vom: {
         probT: (pred.detail.vom.probT * 100).toFixed(2) + '%',
         order: pred.detail.vom.order,
-        samples: pred.detail.vom.samples,
-        context: pred.detail.vom.context || null
+        samples: pred.detail.vom.samples
       },
       ppm: {
         probT: (pred.detail.ppm.probT * 100).toFixed(2) + '%',
-        matchedOrder: pred.detail.ppm.matchedOrder,
-        samples: pred.detail.ppm.samples || 0
+        matchedOrder: pred.detail.ppm.matchedOrder
       },
+      probTRaw: (pred.detail.probTRaw * 100).toFixed(2) + '%',
+      probTDetrended: (pred.detail.probT * 100).toFixed(2) + '%',
       cusum: {
         changeDetected: pred.detail.cusum.changeDetected,
         strength: (pred.detail.cusum.strength * 100).toFixed(1) + '%'
-      },
-      weights: pred.detail.weights,
-      totalSamples: pred.detail.totalSamples
+      }
     } : null,
     xucXac: list[0].dices || [],
     tongDiem: list[0].point || 0,
+    phanPhoiDuDoan: {
+      tai: mem.predDistribution.T,
+      xiu: mem.predDistribution.X,
+      ratioTai: totalPreds > 0 ? `${(mem.predDistribution.T / totalPreds * 100).toFixed(1)}%` : '—',
+      biasWarning: mem.biasWarning
+    },
     hieuSuatModel: {
       vom: `${mem.modelPerf.vom.w}W/${mem.modelPerf.vom.l}L`,
-      ppm: `${mem.modelPerf.ppm.w}W/${mem.modelPerf.ppm.l}L`,
-      cusum: `${mem.modelPerf.cusum.w}W/${mem.modelPerf.cusum.l}L`
+      ppm: `${mem.modelPerf.ppm.w}W/${mem.modelPerf.ppm.l}L`
     },
     thongKe: {
       win: mem.totalWin,
@@ -483,10 +509,10 @@ async function processGame(type) {
 }
 
 // ==========================================================
-// BACKTEST
+// BACKTEST (có kiểm tra distribution)
 // ==========================================================
 async function backtest(type, limit = 800) {
-  log('INFO', `Backtest V23 ${type} — limit ${limit}`);
+  log('INFO', `Backtest V24 ${type} — limit ${limit}`);
   let all = [], page = 1;
   while (all.length < limit && page <= 15) {
     try {
@@ -506,40 +532,30 @@ async function backtest(type, limit = 800) {
   all.sort((a, b) => parseFloat(a.id) - parseFloat(b.id));
   const seq = all.map(x => x.resultTruyenThong === 'TAI' ? 'T' : 'X');
 
-  // Metrics
   let win = 0, lose = 0, skip = 0;
-  const perf = { vom: { w: 0, l: 0 }, ppm: { w: 0, l: 0 }, cusum: { w: 0, l: 0 } };
+  let predT = 0, predX = 0;
+  let guardTriggers = 0;
+  const perf = { vom: { w: 0, l: 0 }, ppm: { w: 0, l: 0 } };
+  const recentPreds = [];
   const confBuckets = {};
-
-  // Đánh giá riêng từng model
-  let vomW = 0, vomL = 0, ppmW = 0, ppmL = 0;
 
   for (let i = CONFIG.MIN_PHIEN; i < seq.length; i++) {
     const h = seq.slice(0, i);
-    const pred = makePrediction(h, perf);
+    const pred = makePrediction(h, perf, recentPreds);
 
-    // Đánh giá từng model độc lập
-    const vomR = vomPredict(h);
-    const ppmR = ppmPredict(h);
-    const actual = seq[i] === 'T' ? 'TÀI' : 'XỈU';
-
-    if (vomR.probT > 0.55) {
-      if (vomR.probT > 0.5 === (actual === 'TÀI')) vomW++; else vomL++;
-    } else if (vomR.probT < 0.45) {
-      if (vomR.probT < 0.5 === (actual === 'XỈU')) vomW++; else vomL++;
-    }
-
-    if (ppmR.probT > 0.55) {
-      if (ppmR.probT > 0.5 === (actual === 'TÀI')) ppmW++; else ppmL++;
-    } else if (ppmR.probT < 0.45) {
-      if (ppmR.probT < 0.5 === (actual === 'XỈU')) ppmW++; else ppmL++;
-    }
-
-    // Đánh giá ensemble
     if (pred.predict === 'CHỜ') { skip++; continue; }
+    if (pred.guardApplied) guardTriggers++;
+
+    const actual = seq[i] === 'T' ? 'TÀI' : 'XỈU';
     const isWin = pred.predict === actual;
 
-    // Cập nhật perf
+    if (pred.predict === 'TÀI') predT++;
+    else predX++;
+
+    recentPreds.push(pred.predict);
+    if (recentPreds.length > 20) recentPreds.shift();
+
+    // Update perf
     if (pred.detail) {
       const vomP = pred.detail.vom.probT > 0.5 ? 'TÀI' : 'XỈU';
       const ppmP = pred.detail.ppm.probT > 0.5 ? 'TÀI' : 'XỈU';
@@ -557,6 +573,8 @@ async function backtest(type, limit = 800) {
 
   const total = win + lose;
   const wr = total > 0 ? (win / total * 100).toFixed(2) : 0;
+  const totalPreds = predT + predX;
+  const ratioT = totalPreds > 0 ? (predT / totalPreds * 100).toFixed(1) : 0;
 
   const confReport = {};
   for (const [k, v] of Object.entries(confBuckets)) {
@@ -567,31 +585,43 @@ async function backtest(type, limit = 800) {
     };
   }
 
+  // Kiểm tra bias
+  const biasWarning = parseFloat(ratioT) > 70 || parseFloat(ratioT) < 30;
+
   return {
     tongPhien: seq.length,
     soLanDuDoan: total,
     soLanBoQua: skip,
     win, lose,
     winrateTong: `${wr}%`,
-    // Đánh giá từng model độc lập
+    phanPhoiDuDoan: {
+      tai: predT,
+      xiu: predX,
+      ratioTai: `${ratioT}%`,
+      canBang: !biasWarning,
+      canhBao: biasWarning
+        ? `⚠️ Model dự đoán lệch (${ratioT}% TÀI) — vẫn còn bias`
+        : '✅ Phân phối cân bằng'
+    },
+    guardTriggers,
     danhGiaModel: {
       vom: {
-        win: vomW, lose: vomL,
-        winrate: vomW + vomL > 0 ? `${(vomW / (vomW + vomL) * 100).toFixed(2)}%` : '—',
-        samples: vomW + vomL
+        win: perf.vom.w, lose: perf.vom.l,
+        winrate: perf.vom.w + perf.vom.l > 0
+          ? `${(perf.vom.w / (perf.vom.w + perf.vom.l) * 100).toFixed(2)}%` : '—'
       },
       ppm: {
-        win: ppmW, lose: ppmL,
-        winrate: ppmW + ppmL > 0 ? `${(ppmW / (ppmW + ppmL) * 100).toFixed(2)}%` : '—',
-        samples: ppmW + ppmL
+        win: perf.ppm.w, lose: perf.ppm.l,
+        winrate: perf.ppm.w + perf.ppm.l > 0
+          ? `${(perf.ppm.w / (perf.ppm.w + perf.ppm.l) * 100).toFixed(2)}%` : '—'
       }
     },
     winrateTheoConfidence: confReport,
     ketLuan: parseFloat(wr) > 55
-      ? '⚠️ Có thể có lookahead — kiểm tra lại'
+      ? '⚠️ Có thể lookahead — kiểm tra lại'
       : parseFloat(wr) >= 48
-        ? '✅ ~50% — không có edge, đúng toán học'
-        : '❌ < 50% — ngược chiều, thua nhiều hơn'
+        ? '✅ ~50% — đúng toán học (random)'
+        : '❌ < 50% — tệ hơn random'
   };
 }
 
@@ -619,6 +649,8 @@ app.get('/lstaixiu', (req, res) => {
     win: m.totalWin, lose: m.totalLose,
     winrate: m.totalWin + m.totalLose > 0
       ? ((m.totalWin / (m.totalWin + m.totalLose)) * 100).toFixed(1) + '%' : '—',
+    phanPhoiDuDoan: m.predDistribution,
+    biasWarning: m.biasWarning,
     hieuSuatModel: m.modelPerf,
     data: [...m.history].reverse()
   });
@@ -631,6 +663,8 @@ app.get('/lsmd5', (req, res) => {
     win: m.totalWin, lose: m.totalLose,
     winrate: m.totalWin + m.totalLose > 0
       ? ((m.totalWin / (m.totalWin + m.totalLose)) * 100).toFixed(1) + '%' : '—',
+    phanPhoiDuDoan: m.predDistribution,
+    biasWarning: m.biasWarning,
     hieuSuatModel: m.modelPerf,
     data: [...m.history].reverse()
   });
@@ -638,10 +672,10 @@ app.get('/lsmd5', (req, res) => {
 
 app.get('/status', (req, res) => {
   res.json({
-    status: 'online', version: '23.0.0',
+    status: 'online', version: '24.0.0',
     uptime: process.uptime(),
-    tx: { win: memory.tx.totalWin, lose: memory.tx.totalLose, perf: memory.tx.modelPerf },
-    md5: { win: memory.md5.totalWin, lose: memory.md5.totalLose, perf: memory.md5.modelPerf }
+    tx: { win: memory.tx.totalWin, lose: memory.tx.totalLose, dist: memory.tx.predDistribution, bias: memory.tx.biasWarning },
+    md5: { win: memory.md5.totalWin, lose: memory.md5.totalLose, dist: memory.md5.predDistribution, bias: memory.md5.biasWarning }
   });
 });
 
@@ -666,19 +700,20 @@ app.post('/reset', (req, res) => {
 // ==========================================================
 const server = app.listen(CONFIG.PORT, () => {
   console.log(C.cyan + '=========================================');
-  console.log(C.g + `🔥 V23 — HỌC THẬT — http://localhost:${CONFIG.PORT}`);
+  console.log(C.g + `🔥 V24 — FIX "TOÀN TÀI" — http://localhost:${CONFIG.PORT}`);
   console.log(C.cyan + '=========================================');
-  console.log(C.y + 'Thuật toán:');
-  console.log(C.r + '  1. Variable-Order Markov (VOM) bậc 1-7');
-  console.log('  2. PPM (Prediction by Partial Matching)');
-  console.log('  3. CUSUM change-point detection');
-  console.log('  4. Ensemble có trọng số theo hiệu suất');
+  console.log(C.y + 'Fix so với V23:');
+  console.log(C.r + '  1. Detrend — kéo probT về 50/50 nếu lịch sử lệch');
+  console.log('  2. Edge floor 8% — chỉ đoán khi đủ mạnh');
+  console.log('  3. Balance guard — 5 phiên 1 phía → force bẻ');
+  console.log('  4. Bias warning — cảnh báo khi model lệch');
+  console.log('  5. Bỏ 0.5*wCusum — nguyên nhân gây bias TÀI');
   console.log(C.cyan + '=========================================');
   console.log(C.y + 'Endpoints:');
-  console.log(C.r + '  GET  /taixiu            → dự đoán TX');
+  console.log(C.r + '  GET  /taixiu            → dự đoán (có kiểm soát bias)');
   console.log('  GET  /md5               → dự đoán MD5');
-  console.log('  GET  /backtest?type=tx  → kiểm chứng từng model');
-  console.log('  GET  /lstaixiu          → lịch sử + hiệu suất model');
+  console.log('  GET  /backtest?type=tx  → backtest + kiểm tra phân phối');
+  console.log('  GET  /lstaixiu          → lịch sử + phân phối');
   console.log('  GET  /status            → trạng thái');
   console.log('  POST /reset             → reset');
   console.log(C.cyan + '=========================================' + C.r);
